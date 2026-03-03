@@ -1,0 +1,17 @@
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+
+pydantic==2.10.6
+pydantic-settings==2.8.1
+
+pandas==2.2.3
+numpy==2.2.3
+scipy==1.15.2
+statsmodels==0.14.4
+
+openpyxl==3.1.5
+
+python-multipart==0.0.20
+
+pytest==8.3.4
+httpx==0.28.1
