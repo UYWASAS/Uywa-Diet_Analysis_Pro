@@ -8,8 +8,6 @@ Responsibilities:
 - Optionally merge COSTS (simple or phase) into unit inputs
 - Provide export helper for Excel reporting
 
-No inferential statistics occur here.
-
 Expected Excel sheets:
 - HOUSE_SUMMARY (required)
 - WEIGH_SAMPLES (optional)
@@ -24,9 +22,8 @@ The output is a ParsedInput object with record lists to make Streamlit caching e
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -39,7 +36,7 @@ from .schemas import (
     UnitType,
     WarningCode,
 )
-from .utils import coalesce, normalize_columns, parse_date_like, safe_int, safe_float
+from .utils import normalize_columns, parse_date_like, safe_float, safe_int
 
 
 REQUIRED_HOUSE_SUMMARY_COLS = {"trial_id", "unit_id", "treatment"}
@@ -84,7 +81,6 @@ def _read_single_table(name: str, file_bytes: bytes) -> ParsedInputBundle:
     if lower.endswith(".csv"):
         df = pd.read_csv(BytesIO(file_bytes))
     elif lower.endswith(".xlsx"):
-        # treat first sheet as the single table
         xl = pd.ExcelFile(BytesIO(file_bytes))
         df = xl.parse(xl.sheet_names[0])
     else:
@@ -102,7 +98,6 @@ def _read_single_table(name: str, file_bytes: bytes) -> ParsedInputBundle:
 def parse_uploaded_file(filename: str, file_bytes: bytes) -> ParsedInput:
     """
     Parse uploaded file into ParsedInput.
-
     This function does NOT validate domain rules (that happens in validation.py),
     but it will normalize column names, apply defaults, and compute derived fields.
     """
@@ -110,7 +105,6 @@ def parse_uploaded_file(filename: str, file_bytes: bytes) -> ParsedInput:
         try:
             bundle = _read_excel_template(file_bytes)
         except Exception:
-            # If it doesn't look like a template, treat as single-table
             bundle = _read_single_table(filename, file_bytes)
     elif filename.lower().endswith(".csv"):
         bundle = _read_single_table(filename, file_bytes)
@@ -121,6 +115,7 @@ def parse_uploaded_file(filename: str, file_bytes: bytes) -> ParsedInput:
     ws = normalize_columns(bundle.weigh_samples) if bundle.weigh_samples is not None else None
     cs = normalize_columns(bundle.costs) if bundle.costs is not None else None
 
+    assert hs is not None
     hs = _clean_house_summary(hs)
     if ws is not None:
         ws = _clean_weigh_samples(ws)
@@ -140,17 +135,14 @@ def parse_uploaded_file(filename: str, file_bytes: bytes) -> ParsedInput:
 def _clean_house_summary(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Apply defaults for missing columns
     for col, val in HOUSE_SUMMARY_DEFAULTS.items():
         if col not in df.columns:
             df[col] = val
 
-    # Ensure required columns exist
     missing = [c for c in REQUIRED_HOUSE_SUMMARY_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"HOUSE_SUMMARY missing required columns: {missing}")
 
-    # If days missing, attempt to compute from start_date+end_date
     if "days" not in df.columns:
         if "start_date" in df.columns and "end_date" in df.columns:
             start = df["start_date"].apply(parse_date_like)
@@ -159,7 +151,6 @@ def _clean_house_summary(df: pd.DataFrame) -> pd.DataFrame:
         else:
             raise ValueError("HOUSE_SUMMARY must include 'days' or both 'start_date' and 'end_date'.")
 
-    # Standardize types
     df["trial_id"] = df["trial_id"].astype(str).str.strip()
     df["unit_id"] = df["unit_id"].astype(str).str.strip()
     df["treatment"] = df["treatment"].astype(str).str.strip()
@@ -167,27 +158,41 @@ def _clean_house_summary(df: pd.DataFrame) -> pd.DataFrame:
     df["unit_type"] = df["unit_type"].fillna("house").astype(str).str.strip().str.lower()
     df["days"] = df["days"].apply(safe_int)
 
-    # Numeric columns (optional handled later)
-    num_cols = [
-        "birds_placed",
-        "mortality_total",
-        "birds_sold",
+    # Parse numeric columns when present
+    int_cols = ["birds_placed", "mortality_total", "birds_sold", "final_sample_n"]
+    float_cols = [
         "feed_delivered_kg",
         "feed_refusals_kg",
         "bw_initial_mean_g",
         "bw_final_mean_g",
         "bw_final_sd_g",
+        "diet_cost_per_kg",
+        "additive_cost_total",
+        "chick_cost_per_bird",
+        "other_variable_costs_total",
     ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = df[c].apply(lambda x: safe_float(x) if "kg" in c or "bw_" in c else safe_int(x))  # type: ignore[arg-type]
 
-    # Fill defaults for missing numeric columns expected by downstream
+    for c in int_cols:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: (safe_int(x) if pd.notna(x) else None))
+
+    for c in float_cols:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: (safe_float(x) if pd.notna(x) else None))
+
     if "feed_refusals_kg" in df.columns:
         df["feed_refusals_kg"] = df["feed_refusals_kg"].fillna(0.0)
-
     if "mortality_total" in df.columns:
         df["mortality_total"] = df["mortality_total"].fillna(0)
+
+    # Costs defaults (if provided)
+    for c, default in [
+        ("additive_cost_total", 0.0),
+        ("chick_cost_per_bird", 0.0),
+        ("other_variable_costs_total", 0.0),
+    ]:
+        if c in df.columns:
+            df[c] = df[c].fillna(default)
 
     return df
 
@@ -208,13 +213,15 @@ def _clean_weigh_samples(df: pd.DataFrame) -> pd.DataFrame:
     df["treatment"] = df["treatment"].astype(str).str.strip()
 
     if "day" in df.columns:
-        df["day"] = df["day"].apply(safe_int)
+        df["day"] = df["day"].apply(lambda x: safe_int(x) if pd.notna(x) else None)
     if "date" in df.columns:
-        df["date"] = df["date"].apply(parse_date_like)
+        df["date"] = df["date"].apply(lambda x: parse_date_like(x) if pd.notna(x) else None)
 
-    for c in ["sample_n", "bw_mean_g", "bw_sd_g"]:
+    if "sample_n" in df.columns:
+        df["sample_n"] = df["sample_n"].apply(lambda x: safe_int(x) if pd.notna(x) else None)
+    for c in ["bw_mean_g", "bw_sd_g"]:
         if c in df.columns:
-            df[c] = df[c].apply(safe_float if c != "sample_n" else safe_int)
+            df[c] = df[c].apply(lambda x: safe_float(x) if pd.notna(x) else None)
 
     return df
 
@@ -231,24 +238,26 @@ def _clean_costs(df: pd.DataFrame) -> pd.DataFrame:
     df["unit_id"] = df["unit_id"].astype(str).str.strip()
     df["treatment"] = df["treatment"].astype(str).str.strip()
 
-    # Determine if phase-style or simple style by presence of 'phase'
+    # Phase mode or simple mode
     if "phase" in df.columns:
-        # phase mode
-        for c in ["feed_cost_per_kg", "additive_cost_total_phase"]:
-            if c in df.columns:
-                df[c] = df[c].apply(safe_float)
+        if "feed_cost_per_kg" in df.columns:
+            df["feed_cost_per_kg"] = df["feed_cost_per_kg"].apply(lambda x: safe_float(x) if pd.notna(x) else None)
+        if "additive_cost_total_phase" in df.columns:
+            df["additive_cost_total_phase"] = df["additive_cost_total_phase"].apply(
+                lambda x: safe_float(x) if pd.notna(x) else 0.0
+            )
     else:
-        # simple mode
         for c in ["diet_cost_per_kg", "additive_cost_total", "chick_cost_per_bird", "other_variable_costs_total"]:
             if c in df.columns:
-                df[c] = df[c].apply(safe_float)
+                df[c] = df[c].apply(lambda x: safe_float(x) if pd.notna(x) else None)
 
-        if "additive_cost_total" in df.columns:
-            df["additive_cost_total"] = df["additive_cost_total"].fillna(0.0)
-        if "chick_cost_per_bird" in df.columns:
-            df["chick_cost_per_bird"] = df["chick_cost_per_bird"].fillna(0.0)
-        if "other_variable_costs_total" in df.columns:
-            df["other_variable_costs_total"] = df["other_variable_costs_total"].fillna(0.0)
+        for c, default in [
+            ("additive_cost_total", 0.0),
+            ("chick_cost_per_bird", 0.0),
+            ("other_variable_costs_total", 0.0),
+        ]:
+            if c in df.columns:
+                df[c] = df[c].fillna(default)
 
     return df
 
@@ -258,15 +267,14 @@ def _derive_bw_from_weigh_samples(
     ws: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, List[AnalysisWarning]]:
     """
-    Fill missing bw_initial_mean_g / bw_final_mean_g / bw_final_sd_g from WEIGH_SAMPLES
+    Fill missing bw_initial_mean_g / bw_final_mean_g / bw_final_sd_g / final_sample_n from WEIGH_SAMPLES
     by using earliest and latest record per (trial_id, unit_id).
     """
     warnings: List[AnalysisWarning] = []
     hs = hs.copy()
-
     ws = ws.copy()
 
-    # Decide timeline column
+    # Decide timeline column (prefer day)
     if "day" in ws.columns and ws["day"].notna().any():
         ws["_time"] = ws["day"]
     else:
@@ -278,19 +286,30 @@ def _derive_bw_from_weigh_samples(
     first = ws.groupby(key_cols, as_index=False).first()
     last = ws.groupby(key_cols, as_index=False).last()
 
-    first = first.rename(columns={"bw_mean_g": "_bw_initial_mean_g", "bw_sd_g": "_bw_initial_sd_g", "sample_n": "_initial_sample_n"})
-    last = last.rename(columns={"bw_mean_g": "_bw_final_mean_g", "bw_sd_g": "_bw_final_sd_g", "sample_n": "_final_sample_n"})
+    first = first.rename(
+        columns={
+            "bw_mean_g": "_bw_initial_mean_g",
+            "sample_n": "_initial_sample_n",
+        }
+    )
+    last = last.rename(
+        columns={
+            "bw_mean_g": "_bw_final_mean_g",
+            "bw_sd_g": "_bw_final_sd_g",
+            "sample_n": "_final_sample_n",
+        }
+    )
 
     merged = hs.merge(first[key_cols + ["_bw_initial_mean_g", "_initial_sample_n"]], on=key_cols, how="left")
     merged = merged.merge(last[key_cols + ["_bw_final_mean_g", "_bw_final_sd_g", "_final_sample_n"]], on=key_cols, how="left")
 
-    # Fill missing
+    # Fill missing BW means
     for col_hs, col_ws in [
         ("bw_initial_mean_g", "_bw_initial_mean_g"),
         ("bw_final_mean_g", "_bw_final_mean_g"),
     ]:
         if col_hs in merged.columns:
-            missing_mask = merged[col_hs].isna()
+            missing_mask = merged[col_hs].isna() & merged[col_ws].notna()
             if missing_mask.any():
                 merged.loc[missing_mask, col_hs] = merged.loc[missing_mask, col_ws]
                 for _, r in merged.loc[missing_mask, ["trial_id", "unit_id"]].drop_duplicates().iterrows():
@@ -302,6 +321,7 @@ def _derive_bw_from_weigh_samples(
                         )
                     )
 
+    # Fill missing SD
     if "bw_final_sd_g" in merged.columns:
         missing_sd = merged["bw_final_sd_g"].isna() & merged["_bw_final_sd_g"].notna()
         if missing_sd.any():
@@ -315,15 +335,16 @@ def _derive_bw_from_weigh_samples(
                     )
                 )
 
-    # Provide final_sample_n when present
+    # Fill missing final_sample_n (DO NOT delete it later)
     if "final_sample_n" not in merged.columns:
         merged["final_sample_n"] = None
+
     missing_n = merged["final_sample_n"].isna() & merged["_final_sample_n"].notna()
     if missing_n.any():
         merged.loc[missing_n, "final_sample_n"] = merged.loc[missing_n, "_final_sample_n"]
 
-    # Drop helper columns
-    merged = merged.drop(columns=[c for c in merged.columns if c.startswith("_bw_") or c.endswith("_sample_n")], errors="ignore")
+    # Drop helper columns only (keep final_sample_n!)
+    merged = merged.drop(columns=[c for c in merged.columns if c.startswith("_bw_") or c in {"_time", "_initial_sample_n", "_final_sample_n"}], errors="ignore")
     return merged, warnings
 
 
@@ -336,11 +357,7 @@ def _merge_costs_into_house_summary(
 
     Supports:
     - Simple mode: diet_cost_per_kg, additive_cost_total, chick_cost_per_bird, other_variable_costs_total
-    - Phase mode: sum feed_cost_per_kg across phases is NOT correct without feed kg per phase.
-      For now we interpret phase mode as:
-        diet_cost_per_kg := weighted not available -> use mean(feed_cost_per_kg) as placeholder.
-        additive_cost_total := sum(additive_cost_total_phase)
-      This is flagged via warnings and can be improved later with phase feed intake.
+    - Phase mode: approximations (warned)
     """
     warnings: List[AnalysisWarning] = []
     hs = hs.copy()
@@ -349,8 +366,12 @@ def _merge_costs_into_house_summary(
 
     if "phase" in costs.columns:
         tmp = costs.copy()
-        tmp["feed_cost_per_kg"] = tmp.get("feed_cost_per_kg", pd.Series([None] * len(tmp))).apply(safe_float)
-        tmp["additive_cost_total_phase"] = tmp.get("additive_cost_total_phase", pd.Series([0.0] * len(tmp))).apply(safe_float)
+        tmp["feed_cost_per_kg"] = tmp.get("feed_cost_per_kg", pd.Series([None] * len(tmp))).apply(
+            lambda x: safe_float(x) if pd.notna(x) else None
+        )
+        tmp["additive_cost_total_phase"] = tmp.get("additive_cost_total_phase", pd.Series([0.0] * len(tmp))).apply(
+            lambda x: safe_float(x) if pd.notna(x) else 0.0
+        )
 
         agg = (
             tmp.groupby(key, as_index=False)
@@ -369,11 +390,8 @@ def _merge_costs_into_house_summary(
             )
         )
     else:
-        merged = hs.merge(
-            costs[key + [c for c in ["diet_cost_per_kg", "additive_cost_total", "chick_cost_per_bird", "other_variable_costs_total"] if c in costs.columns]],
-            on=key,
-            how="left",
-        )
+        keep_cols = [c for c in ["diet_cost_per_kg", "additive_cost_total", "chick_cost_per_bird", "other_variable_costs_total"] if c in costs.columns]
+        merged = hs.merge(costs[key + keep_cols], on=key, how="left")
 
     # Default missing costs to 0 where appropriate
     for c, default in [
@@ -389,7 +407,6 @@ def _merge_costs_into_house_summary(
     if "diet_cost_per_kg" not in merged.columns:
         merged["diet_cost_per_kg"] = None
 
-    # Warn if costs mostly missing
     if merged["diet_cost_per_kg"].isna().all():
         warnings.append(
             AnalysisWarning(
@@ -442,28 +459,37 @@ def _parsed_input_to_units(self: ParsedInput) -> List[TrialUnitInput]:
     cs = dfs["costs"]
     assert hs is not None
 
-    warnings: List[AnalysisWarning] = []
+    # Ensure expected columns exist (so derivation can fill them)
+    for col, default in [
+        ("bw_initial_mean_g", None),
+        ("bw_final_mean_g", None),
+        ("bw_final_sd_g", None),
+        ("final_sample_n", None),
+    ]:
+        if col not in hs.columns:
+            hs[col] = default
 
-    # Derive BW from weigh samples if needed
-    if ws is not None and ("bw_initial_mean_g" in hs.columns or "bw_final_mean_g" in hs.columns):
-        hs, w = _derive_bw_from_weigh_samples(hs, ws)
-        warnings.extend(w)
+    # Derive BW/sample_n from weigh samples if present
+    if ws is not None:
+        hs, _io_warnings = _derive_bw_from_weigh_samples(hs, ws)
+    else:
+        _io_warnings = []
 
     # Merge costs if present
     if cs is not None:
-        hs, w = _merge_costs_into_house_summary(hs, cs)
-        warnings.extend(w)
+        hs, _cost_warnings = _merge_costs_into_house_summary(hs, cs)
+    else:
+        _cost_warnings = []
 
-    # Persist cleaned_input updates
-    if warnings:
-        # Store warnings count only; actual warnings handled by validation/calculation/stats later
-        self.cleaned_input = {**self.cleaned_input, "io_warnings_count": len(warnings)}
+    # Persist cleaned_input updates (metadata only)
+    total_io_warnings = len(_io_warnings) + len(_cost_warnings)
+    if total_io_warnings:
+        self.cleaned_input = {**self.cleaned_input, "io_warnings_count": total_io_warnings}
 
     units = _to_unit_inputs(hs)
     return units
 
 
-# Bind method without requiring users to import io helpers
 ParsedInput.to_units = _parsed_input_to_units  # type: ignore[attr-defined]
 
 
@@ -480,10 +506,7 @@ def export_report_xlsx(payload: ExportPayload) -> bytes:
     """
     out = BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        # CLEANED_INPUT as 2-col table
-        ci = pd.DataFrame(
-            [{"key": k, "value": v} for k, v in (payload.cleaned_input or {}).items()]
-        )
+        ci = pd.DataFrame([{"key": k, "value": v} for k, v in (payload.cleaned_input or {}).items()])
         ci.to_excel(writer, index=False, sheet_name="CLEANED_INPUT")
 
         payload.unit_kpis.to_excel(writer, index=False, sheet_name="UNIT_KPIS")
