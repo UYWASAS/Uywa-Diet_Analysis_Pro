@@ -1,28 +1,8 @@
-"""
-PCTA - Poultry Commercial Trial Analyzer (Streamlit)
-
-UI:
-- Login (multi-user, similar to the user's pet app)
-- Upload Excel/CSV
-- Preview raw/cleaned inputs
-- Validate + warnings
-- Compute per-unit KPIs
-- Descriptive summaries and (safe) inferential stats
-- Export an Excel report
-
-CRITICAL SAFETY:
-- Inferential statistics are disabled if min replication per treatment < 2 (handled in core.stats).
-
-Branding/theming:
-- Sidebar branding block with logo (pcta/assets/logo.png)
-- Global CSS to match corporate style (gradient background, dark sidebar, rounded buttons)
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -36,24 +16,19 @@ from core.stats import StatsOptions, run_inferential_statistics
 from core.validation import ValidationOptions, validate_units
 
 
-# ======================== BLOQUE 1: CONFIG + ESTILO CORPORATIVO ========================
+# ======================== CONFIG + ESTILO ========================
 
-st.set_page_config(page_title="PCTA — Poultry Commercial Trial Analyzer", layout="wide")
+st.set_page_config(page_title="PCTA — Analizador de Ensayos Comerciales", layout="wide")
 
 st.markdown(
     """
     <style>
-    /* App background */
     html, body, .stApp, .block-container {
         background: linear-gradient(120deg, #ffffff 0%, #eef4fc 100%) !important;
     }
 
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background-color: #2C3E50 !important;
-    }
+    section[data-testid="stSidebar"] { background-color: #2C3E50 !important; }
 
-    /* Sidebar text ONLY (avoid overriding widgets too aggressively) */
     section[data-testid="stSidebar"] h1,
     section[data-testid="stSidebar"] h2,
     section[data-testid="stSidebar"] h3,
@@ -64,7 +39,6 @@ st.markdown(
         color: #fff !important;
     }
 
-    /* Sidebar inputs: ensure contrast */
     section[data-testid="stSidebar"] input,
     section[data-testid="stSidebar"] textarea,
     section[data-testid="stSidebar"] select {
@@ -74,7 +48,6 @@ st.markdown(
         border-radius: 8px !important;
     }
 
-    /* Buttons */
     .stButton > button, .stDownloadButton > button {
         background-color: #2176ff !important;
         color: #fff !important;
@@ -89,15 +62,9 @@ st.markdown(
         box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.18) !important;
     }
 
-    /* Main container padding */
-    .block-container {
-        padding: 2rem 3.5rem;
-    }
-
-    /* Hide Streamlit footer */
+    .block-container { padding: 2rem 3.5rem; }
     footer {visibility: hidden !important;}
 
-    /* Cards */
     .pcta-card {
         background: #ffffff;
         border: 1px solid #e6eefb;
@@ -105,62 +72,32 @@ st.markdown(
         padding: 16px 18px;
         box-shadow: 0px 2px 10px rgba(16, 24, 40, 0.06);
     }
-
-    .pcta-card-dark {
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.18);
-        border-radius: 14px;
-        padding: 12px 14px;
-    }
-
-    .pcta-muted {
-        color: #4b5563;
-        font-size: 0.95rem;
-    }
+    .pcta-muted { color: #4b5563; font-size: 0.95rem; }
 
     .pcta-kpi {
-        display:flex;
-        gap:18px;
-        align-items:stretch;
-        flex-wrap:wrap;
-        margin-top: 6px;
+        display:flex; gap:18px; align-items:stretch; flex-wrap:wrap; margin-top: 6px;
     }
     .pcta-kpi > div{
-        background:#f7faff;
-        border:1px solid #dbeafe;
-        border-radius:12px;
-        padding:12px 14px;
-        min-width: 180px;
+        background:#f7faff; border:1px solid #dbeafe; border-radius:12px; padding:12px 14px; min-width: 180px;
     }
-    .pcta-kpi .label{
-        font-size: 0.82rem;
-        color:#334155;
-        font-weight:700;
-        margin-bottom:4px;
-    }
-    .pcta-kpi .value{
-        font-size: 1.25rem;
-        color:#0f172a;
-        font-weight:900;
-        letter-spacing: -0.01em;
-    }
+    .pcta-kpi .label{ font-size: 0.82rem; color:#334155; font-weight:700; margin-bottom:4px; }
+    .pcta-kpi .value{ font-size: 1.25rem; color:#0f172a; font-weight:900; letter-spacing: -0.01em; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ======================== BLOQUE 2: LOGIN GATE ========================
+# ======================== LOGIN ========================
 
 if not st.session_state.get("logged_in", False):
     login_ui()
 
 user = get_current_user()
 if not user:
-    # Extra safety; login_ui should st.stop() already.
     st.error("El usuario no está autenticado.")
     st.stop()
 
-# ======================== BLOQUE 3: ESTADO DE SESIÓN ========================
+# ======================== ESTADO ========================
 
 
 @dataclass(frozen=True)
@@ -204,8 +141,10 @@ def _set_state(**kwargs) -> None:
 
 def _warnings_df(warnings: List[AnalysisWarning]) -> pd.DataFrame:
     if not warnings:
-        return pd.DataFrame(columns=["code", "message", "context"])
-    return pd.DataFrame([{"code": w.code.value, "message": w.message, "context": w.context} for w in warnings])
+        return pd.DataFrame(columns=["codigo", "mensaje", "contexto"])
+    return pd.DataFrame(
+        [{"codigo": w.code.value, "mensaje": w.message, "contexto": w.context} for w in warnings]
+    )
 
 
 def _replication_summary(units: List[TrialUnitInput]) -> Dict[str, int]:
@@ -213,50 +152,34 @@ def _replication_summary(units: List[TrialUnitInput]) -> Dict[str, int]:
     return df.groupby("treatment").size().astype(int).to_dict()
 
 
+def _numeric_kpi_columns(unit_kpis_df: pd.DataFrame) -> List[str]:
+    id_cols = {"trial_id", "unit_type", "unit_id", "treatment"}
+    cols = [
+        c
+        for c in unit_kpis_df.columns
+        if c not in id_cols and pd.api.types.is_numeric_dtype(unit_kpis_df[c])
+    ]
+    return cols
+
+
 _init_state()
 state: AppState = st.session_state["pcta_state"]
 
-# ======================== BLOQUE 4: SIDEBAR CORPORATIVO ========================
+# ======================== SIDEBAR (MINIMAL) ========================
 
 with st.sidebar:
-    # Logo: pcta/assets/logo.png (robust path)
     logo_path = Path(__file__).resolve().parent / "assets" / "logo.png"
     if logo_path.exists():
         st.image(str(logo_path), use_container_width=True)
-    else:
-        st.markdown(
-            """
-            <div class="pcta-card-dark">
-              <div style="text-align:center; font-weight:900; font-size: 1.05rem; color:#fff;">PCTA</div>
-              <div style="text-align:center; font-size: 0.85rem; opacity:0.95; color:#fff;">Poultry Commercial Trial Analyzer</div>
-              <div style="text-align:center; font-size: 0.78rem; opacity:0.85; margin-top:6px; color:#fff;">
-                Logo missing: expected <code style="color:#fff;">pcta/assets/logo.png</code>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
     st.markdown(
         f"""
-        <div style="text-align:center; margin-top: 10px; margin-bottom: 10px;">
-            <h2 style="font-family:Montserrat,system-ui,sans-serif; margin:0; color:#fff;">
-                UYWA Nutrition
-            </h2>
-            <p style="font-size:13px; margin:0; color:#fff; opacity:0.95;">
-                Nutrición de Precisión • Evidencia
-            </p>
-            <br>
-            <hr style="border:1px solid rgba(255,255,255,0.35);">
-            <p style="font-size:12px; color:#fff; margin:0;">
-                Usuario: <b>{user.get("name","")}</b>
-            </p>
-            <p style="font-size:11px; color:#fff; margin:0; opacity:0.85;">
-                Rol: {user.get("role","")} • {"Premium" if user.get("premium", False) else "Standard"}
-            </p>
-            <p style="font-size:11px; color:#fff; margin:0; opacity:0.85;">
-                © 2026 — Derechos reservados
-            </p>
+        <div style="text-align:center; margin-top: 6px; margin-bottom: 6px;">
+            <h3 style="margin:0; color:#fff; font-family:Montserrat,system-ui,sans-serif;">UYWA Nutrition</h3>
+            <p style="font-size:12px; margin:0; color:#fff; opacity:0.95;">PCTA — Ensayos comerciales</p>
+            <hr style="border:1px solid rgba(255,255,255,0.35); margin:10px 0;">
+            <p style="font-size:12px; color:#fff; margin:0;">Usuario: <b>{user.get("name","")}</b></p>
+            <p style="font-size:11px; color:#fff; margin:0; opacity:0.85;">Rol: {user.get("role","")} • {"Premium" if user.get("premium", False) else "Standard"}</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -265,54 +188,47 @@ with st.sidebar:
     logout_button()
 
     st.divider()
-    st.subheader("Upload")
-    uploaded = st.file_uploader(
-        "Excel (.xlsx) or CSV (.csv)",
+    st.subheader("Carga de archivos")
+
+    uploaded_main = st.file_uploader(
+        "Ensayo (Excel .xlsx o CSV .csv)",
         type=["xlsx", "csv"],
         accept_multiple_files=False,
-        label_visibility="visible",
+        key="uploader_main",
     )
 
-    st.divider()
-    st.subheader("Options")
-    alpha = st.number_input("alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
-    enable_posthoc = st.checkbox("Posthoc (when applicable)", value=True)
+    uploaded_costs_extra = st.file_uploader(
+        "Costos (opcional, archivo aparte .xlsx/.csv)",
+        type=["xlsx", "csv"],
+        accept_multiple_files=False,
+        key="uploader_costs_extra",
+        help="Si tu archivo principal no trae COSTS, puedes cargar un archivo de costos por separado.",
+    )
 
-    st.divider()
-    st.subheader("Validation")
-    wg_negative_is_error = st.checkbox("Block negative WG (WG < 0)", value=True)
+# ======================== HEADER ========================
 
-    st.divider()
-    run_btn = st.button("Run analysis", type="primary", use_container_width=True)
-
-    st.divider()
-    st.subheader("Export")
-    if state.report_bytes is not None:
-        st.download_button(
-            "Download Excel report",
-            data=state.report_bytes,
-            file_name="pcta_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    else:
-        st.caption("Run analysis to enable export.")
-
-# ======================== BLOQUE 5: HEADER + TABS ========================
-
-st.title("PCTA — Poultry Commercial Trial Analyzer")
+st.title("PCTA — Analizador de Ensayos Comerciales Avícolas")
 st.markdown(
-    "<div class='pcta-muted'>Carga datos de ensayo, valida, calcula KPIs, compara tratamientos y exporta reporte.</div>",
+    "<div class='pcta-muted'>Carga datos, valida, calcula KPIs, compara tratamientos, genera gráficos y exporta reporte.</div>",
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["1) Preview", "2) Validation", "3) KPIs", "4) Stats", "5) Export & Notes"])
+tabs = st.tabs(
+    [
+        "1) Vista previa",
+        "2) Configuración",
+        "3) Resultados (KPIs)",
+        "4) Estadística",
+        "5) Gráficos",
+        "6) Exportar",
+    ]
+)
 
-# ======================== BLOQUE 6: PARSE (ON UPLOAD) ========================
+# ======================== PARSE MAIN FILE ========================
 
-if uploaded is not None:
+if uploaded_main is not None:
     try:
-        parsed = parse_uploaded_file(uploaded.name, uploaded.getvalue())
+        parsed = parse_uploaded_file(uploaded_main.name, uploaded_main.getvalue())
         _set_state(
             parsed=parsed,
             units=None,
@@ -323,7 +239,7 @@ if uploaded is not None:
             report_bytes=None,
         )
     except Exception as e:
-        st.error(f"Failed to parse file: {e}")
+        st.error(f"No se pudo leer el archivo principal: {e}")
         _set_state(
             parsed=None,
             units=None,
@@ -337,9 +253,9 @@ if uploaded is not None:
 # ======================== TAB 1: PREVIEW ========================
 
 with tabs[0]:
-    st.subheader("Preview")
+    st.subheader("Vista previa del input")
     if state.parsed is None:
-        st.info("Upload a file to preview inputs.")
+        st.info("Carga un archivo principal para ver la vista previa.")
     else:
         dfs = state.parsed.to_dataframes()
         hs = dfs["house_summary"]
@@ -349,9 +265,9 @@ with tabs[0]:
         st.markdown(
             f"""
             <div class="pcta-card">
-              <b>Detected input mode:</b> {state.parsed.mode.value}
+              <b>Modo detectado:</b> {state.parsed.mode.value}
               <div class="pcta-muted" style="margin-top:6px;">
-                HOUSE_SUMMARY is required. WEIGH_SAMPLES and COSTS are optional.
+                HOUSE_SUMMARY es obligatorio. WEIGH_SAMPLES y COSTS son opcionales.
               </div>
             </div>
             """,
@@ -360,183 +276,153 @@ with tabs[0]:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**HOUSE_SUMMARY (or single-table)**")
+            st.markdown("**HOUSE_SUMMARY (o tabla única)**")
             st.dataframe(hs.head(200), use_container_width=True, hide_index=True)
         with c2:
-            st.markdown("**WEIGH_SAMPLES (optional)**")
+            st.markdown("**WEIGH_SAMPLES (opcional)**")
             if ws is None:
-                st.caption("Not provided.")
+                st.caption("No proporcionado.")
             else:
                 st.dataframe(ws.head(200), use_container_width=True, hide_index=True)
 
-        st.markdown("**COSTS (optional)**")
+        st.markdown("**COSTS (opcional)**")
         if cs is None:
-            st.caption("Not provided.")
+            st.caption("No proporcionado dentro del archivo principal.")
         else:
             st.dataframe(cs.head(200), use_container_width=True, hide_index=True)
 
-# ======================== TAB 2: VALIDATION ========================
+        if uploaded_costs_extra is not None:
+            st.info("También cargaste un archivo de COSTOS aparte. En la siguiente pestaña puedes elegir cómo usarlo.")
+
+# ======================== TAB 2: CONFIGURACIÓN ========================
 
 with tabs[1]:
-    st.subheader("Validation")
-    if state.units is None:
-        st.info("Run analysis to validate.")
-    else:
-        rep = _replication_summary(state.units)
-        min_n = int(min(rep.values())) if rep else 0
+    st.subheader("Configuración de análisis")
 
-        st.markdown(
-            f"""
-            <div class="pcta-card">
-              <b>Replication by treatment:</b> {rep}<br>
-              <b>Min n per treatment:</b> {min_n}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    colA, colB = st.columns(2)
 
-        if state.warnings:
-            st.markdown("#### Warnings")
-            st.dataframe(_warnings_df(state.warnings), use_container_width=True, hide_index=True)
-        else:
-            st.success("No warnings.")
+    with colA:
+        st.markdown("### Validación")
+        wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True)
+        st.caption("Si está activo, un WG negativo detiene el análisis (error).")
 
-# ======================== TAB 3: KPIs + FIGURES ========================
+    with colB:
+        st.markdown("### Estadística")
+        alpha = st.number_input("Nivel de significancia (alpha)", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
+        enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True)
 
-with tabs[2]:
-    st.subheader("Unit KPIs")
-    if state.unit_kpis_df is None:
-        st.info("Run analysis to compute KPIs.")
-    else:
-        st.dataframe(state.unit_kpis_df, use_container_width=True, hide_index=True)
-
-        id_cols = {"trial_id", "unit_type", "unit_id", "treatment"}
-        metric_options = [
-            c
-            for c in state.unit_kpis_df.columns
-            if c not in id_cols and pd.api.types.is_numeric_dtype(state.unit_kpis_df[c])
-        ]
-        if not metric_options:
-            st.warning("No numeric KPI columns available to chart.")
-        else:
-            default_metric = "fcr" if "fcr" in metric_options else metric_options[0]
-            metric = st.selectbox(
-                "Metric to visualize",
-                options=metric_options,
-                index=metric_options.index(default_metric),
-            )
-
-            g = state.unit_kpis_df
-            n_units = int(len(g))
-            treatments = sorted(set(g["treatment"].astype(str).tolist()))
-
-            st.markdown(
-                f"""
-                <div class="pcta-kpi">
-                  <div><div class="label">Units</div><div class="value">{n_units}</div></div>
-                  <div><div class="label">Treatments</div><div class="value">{len(treatments)}</div></div>
-                  <div><div class="label">Selected metric</div><div class="value">{metric}</div></div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            try:
-                import plotly.express as px
-            except Exception:
-                st.error("Plotly is not installed. Add `plotly` to requirements.txt to enable charts.")
-                st.stop()
-
-            c1, c2 = st.columns(2)
-
-            with c1:
-                fig = px.box(
-                    state.unit_kpis_df,
-                    x="treatment",
-                    y=metric,
-                    points="all",
-                    title=f"Distribution by treatment: {metric}",
-                    template="simple_white",
-                )
-                fig.update_layout(title_font=dict(size=16), xaxis_title="Treatment", yaxis_title=metric)
-                st.plotly_chart(fig, use_container_width=True)
-
-            with c2:
-                means = (
-                    state.unit_kpis_df.groupby("treatment", as_index=False)[metric]
-                    .mean(numeric_only=True)
-                    .sort_values("treatment")
-                )
-                fig2 = px.bar(
-                    means,
-                    x="treatment",
-                    y=metric,
-                    title=f"Mean by treatment: {metric}",
-                    template="simple_white",
-                )
-                fig2.update_layout(title_font=dict(size=16), xaxis_title="Treatment", yaxis_title=metric)
-                st.plotly_chart(fig2, use_container_width=True)
-
-# ======================== TAB 4: STATS ========================
-
-with tabs[3]:
-    st.subheader("Statistics (safe)")
-    if state.stats_df is None:
-        st.info("Run analysis to compute statistics (requires replication).")
-    else:
-        st.dataframe(state.stats_df, use_container_width=True, hide_index=True)
-
-# ======================== TAB 5: EXPORT + NOTES ========================
-
-with tabs[4]:
-    st.subheader("Export & Notes")
-    st.markdown(
-        """
-        <div class="pcta-card">
-          <b>Safety / disclaimers</b>
-          <ul>
-            <li>Inferential statistics are only produced when <b>each treatment</b> has at least <b>2 experimental units</b> (replication).</li>
-            <li>Without replication, PCTA returns descriptive summaries only and a warning.</li>
-            <li>Always confirm data consistency (e.g., birds_sold vs birds_placed and mortality).</li>
-          </ul>
-          <b>Report sheets</b>
-          <ul>
-            <li>CLEANED_INPUT</li>
-            <li>UNIT_KPIS</li>
-            <li>TREATMENT_SUMMARY</li>
-            <li>STATS</li>
-            <li>WARNINGS</li>
-          </ul>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.divider()
+    st.markdown("### Datos económicos (no productivos)")
+    econ_mode = st.radio(
+        "¿Cómo quieres manejar COSTOS?",
+        options=[
+            "Usar COSTS del archivo principal (si existe)",
+            "Usar archivo de costos aparte (si se cargó)",
+            "Ingresar costos manuales (simple)",
+            "No usar costos (solo productivo)",
+        ],
+        index=0,
     )
 
-    if state.report_bytes is None:
-        st.caption("Run analysis to enable export.")
+    manual_costs: Dict[str, float] = {}
+    if econ_mode == "Ingresar costos manuales (simple)":
+        st.caption("Estos valores se aplican a TODOS los tratamientos/unidades (modo simple).")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            manual_costs["diet_cost_per_kg"] = float(st.number_input("Costo alimento (USD/kg)", min_value=0.0, value=0.0, step=0.01))
+        with c2:
+            manual_costs["chick_cost_per_bird"] = float(st.number_input("Costo pollito (USD/ave)", min_value=0.0, value=0.0, step=0.01))
+        with c3:
+            manual_costs["additive_cost_total"] = float(st.number_input("Aditivos total (USD / unidad)", min_value=0.0, value=0.0, step=1.0))
+        manual_costs["other_variable_costs_total"] = float(st.number_input("Otros costos variables (USD / unidad)", min_value=0.0, value=0.0, step=1.0))
 
-# ======================== BLOQUE 7: RUN PIPELINE ========================
+    st.divider()
+    st.markdown("### Variables a analizar (ordenado)")
+    st.caption("Primero corre el análisis para ver todos los KPIs disponibles; luego seleccionas cuáles incluir en estadística y gráficos.")
+    # La selección real se hace después de computar KPIs; aquí dejamos un placeholder.
+
+    st.divider()
+    run_btn = st.button("Correr análisis", type="primary", use_container_width=True)
+
+# ======================== EJECUCIÓN DEL PIPELINE ========================
+
+def _apply_manual_costs_to_units(units: List[TrialUnitInput], costs: Dict[str, float]) -> List[TrialUnitInput]:
+    out: List[TrialUnitInput] = []
+    for u in units:
+        out.append(
+            u.model_copy(
+                update={
+                    "diet_cost_per_kg": costs.get("diet_cost_per_kg", u.diet_cost_per_kg),
+                    "additive_cost_total": costs.get("additive_cost_total", u.additive_cost_total),
+                    "chick_cost_per_bird": costs.get("chick_cost_per_bird", u.chick_cost_per_bird),
+                    "other_variable_costs_total": costs.get("other_variable_costs_total", u.other_variable_costs_total),
+                }
+            )
+        )
+    return out
+
+
+def _parse_extra_costs_file(file) -> Optional[pd.DataFrame]:
+    if file is None:
+        return None
+    p = parse_uploaded_file(file.name, file.getvalue())
+    dfs = p.to_dataframes()
+    return dfs.get("costs")
+
 
 if run_btn:
     if state.parsed is None:
-        st.error("Upload a file first.")
+        st.error("Primero carga el archivo principal.")
     else:
         try:
             units = state.parsed.to_units()
 
+            # Opcional: costos extra o manuales
+            if econ_mode == "Usar archivo de costos aparte (si se cargó)":
+                extra_costs_df = _parse_extra_costs_file(uploaded_costs_extra)
+                if extra_costs_df is None or extra_costs_df.empty:
+                    st.warning("No se detectaron COSTOS en el archivo aparte. Se continúa sin costos.")
+                else:
+                    # Reusar merge del core: lo más simple es reconstruir ParsedInput con costs_records,
+                    # pero para no tocar core ahora, avisamos y dejamos en backlog.
+                    st.warning(
+                        "Modo COSTOS aparte: pendiente de integración completa al core (merge directo). "
+                        "Por ahora usa COSTS en el archivo principal o el modo manual."
+                    )
+
+            if econ_mode == "Ingresar costos manuales (simple)":
+                units = _apply_manual_costs_to_units(units, manual_costs)
+
+            if econ_mode == "No usar costos (solo productivo)":
+                units = _apply_manual_costs_to_units(
+                    units,
+                    {
+                        "diet_cost_per_kg": None,
+                        "additive_cost_total": 0.0,
+                        "chick_cost_per_bird": 0.0,
+                        "other_variable_costs_total": 0.0,
+                    },
+                )
+
+            # Validación
             v_opts = ValidationOptions(wg_negative_is_error=bool(wg_negative_is_error))
             _, v_warnings = validate_units(units, options=v_opts)
 
+            # KPIs
             computed, c_warnings = compute_all_units(units)
             unit_kpis_df = pd.DataFrame([m.model_dump() for m in computed])
 
+            # Summary
             treatment_summary_df = build_treatment_summary(unit_kpis_df)
 
-            metrics = default_metric_list(unit_kpis_df)
+            # Métricas por defecto
+            metrics_default = default_metric_list(unit_kpis_df)
+
+            # Stats (usa default por ahora; luego permitimos elegir)
             s_opts = StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc))
             stats_df, rep_by_trt, min_n, enabled, s_warnings = run_inferential_statistics(
                 computed,
-                metrics=metrics,
+                metrics=metrics_default,
                 options=s_opts,
             )
 
@@ -562,10 +448,9 @@ if run_btn:
                 warnings=all_warnings,
                 report_bytes=report_bytes,
             )
-
-            st.success("Analysis completed.")
+            st.success("Análisis completado. Ve a pestañas de Resultados / Estadística / Gráficos.")
         except Exception as e:
-            st.error(f"Analysis failed: {e}")
+            st.error(f"Falló el análisis: {e}")
             _set_state(
                 units=None,
                 unit_kpis_df=None,
@@ -574,3 +459,148 @@ if run_btn:
                 warnings=[],
                 report_bytes=None,
             )
+
+# ======================== TAB 3: RESULTADOS ========================
+
+with tabs[2]:
+    st.subheader("Resultados: KPIs por unidad + resumen por tratamiento")
+
+    if state.units is None or state.unit_kpis_df is None:
+        st.info("Corre el análisis en la pestaña Configuración.")
+    else:
+        rep = _replication_summary(state.units)
+        min_n = int(min(rep.values())) if rep else 0
+
+        st.markdown(
+            f"""
+            <div class="pcta-card">
+              <b>Replicación por tratamiento:</b> {rep}<br>
+              <b>Mínimo n por tratamiento:</b> {min_n}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if state.warnings:
+            st.markdown("#### Advertencias")
+            st.dataframe(_warnings_df(state.warnings), use_container_width=True, hide_index=True)
+
+        st.markdown("#### KPIs por unidad")
+        st.dataframe(state.unit_kpis_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Resumen por tratamiento (descriptivo)")
+        if state.treatment_summary_df is not None:
+            st.dataframe(state.treatment_summary_df, use_container_width=True, hide_index=True)
+
+# ======================== TAB 4: ESTADÍSTICA (SELECCIÓN DE VARIABLES) ========================
+
+with tabs[3]:
+    st.subheader("Estadística inferencial (segura)")
+
+    if state.units is None or state.unit_kpis_df is None or state.stats_df is None:
+        st.info("Corre el análisis primero.")
+    else:
+        # Selector ordenado de variables: ahora SÍ puedes elegir
+        kpi_cols = _numeric_kpi_columns(state.unit_kpis_df)
+        suggested = [m for m in default_metric_list(state.unit_kpis_df) if m in kpi_cols]
+
+        metrics = st.multiselect(
+            "Selecciona variables (KPIs) para analizar",
+            options=kpi_cols,
+            default=suggested[: min(8, len(suggested))],
+            help="Selecciona las variables que quieres incluir en la tabla de estadística.",
+        )
+
+        if st.button("Recalcular estadística con variables seleccionadas", type="primary"):
+            try:
+                # Re-calcular stats con métricas elegidas (sin re-calcular todo)
+                # Necesitamos los modelos 'computed'. No los guardamos: por simplicidad recalculamos desde units.
+                computed, c_warnings = compute_all_units(state.units)
+                s_opts = StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc))
+                stats_df, rep_by_trt, min_n, enabled, s_warnings = run_inferential_statistics(
+                    computed,
+                    metrics=metrics,
+                    options=s_opts,
+                )
+                # Mantener warnings anteriores + nuevas de stats
+                merged_warnings = list(state.warnings) + list(s_warnings)
+                _set_state(stats_df=stats_df, warnings=merged_warnings)
+                st.success("Estadística actualizada.")
+            except Exception as e:
+                st.error(f"No se pudo recalcular estadística: {e}")
+
+        st.markdown("#### Tabla de estadística")
+        st.dataframe(state.stats_df, use_container_width=True, hide_index=True)
+
+# ======================== TAB 5: GRÁFICOS ========================
+
+with tabs[4]:
+    st.subheader("Gráficos")
+
+    if state.unit_kpis_df is None:
+        st.info("Corre el análisis primero.")
+    else:
+        try:
+            import plotly.express as px
+        except Exception:
+            st.error("No está instalado Plotly. Revisa `pcta/requirements.txt`.")
+            st.stop()
+
+        kpi_cols = _numeric_kpi_columns(state.unit_kpis_df)
+        if not kpi_cols:
+            st.warning("No hay KPIs numéricos para graficar.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                metric = st.selectbox("Variable (KPI)", options=kpi_cols, index=0)
+            with c2:
+                chart_type = st.selectbox("Tipo de gráfico", options=["Boxplot", "Violín", "Barras (media)"], index=0)
+            with c3:
+                scale = st.selectbox("Escala", options=["Lineal", "Log"], index=0)
+
+            fmt_col1, fmt_col2 = st.columns(2)
+            with fmt_col1:
+                decimals = st.slider("Decimales", min_value=0, max_value=6, value=2)
+            with fmt_col2:
+                as_percent = st.checkbox("Mostrar como %", value=False, help="Solo cambia formato visual.")
+
+            df = state.unit_kpis_df.copy()
+            y = metric
+            if as_percent:
+                df["_metric_fmt"] = df[y] * 100.0
+                y_plot = "_metric_fmt"
+                y_label = f"{metric} (%)"
+            else:
+                y_plot = y
+                y_label = metric
+
+            if chart_type == "Boxplot":
+                fig = px.box(df, x="treatment", y=y_plot, points="all", template="simple_white", title=f"{y_label} por tratamiento")
+            elif chart_type == "Violín":
+                fig = px.violin(df, x="treatment", y=y_plot, box=True, points="all", template="simple_white", title=f"{y_label} por tratamiento")
+            else:
+                means = df.groupby("treatment", as_index=False)[y_plot].mean(numeric_only=True)
+                fig = px.bar(means, x="treatment", y=y_plot, template="simple_white", title=f"Media de {y_label} por tratamiento")
+
+            if scale == "Log":
+                fig.update_yaxes(type="log")
+
+            fig.update_traces(hovertemplate="%{x}<br>%{y:." + str(decimals) + "f}<extra></extra>")
+            fig.update_layout(yaxis_title=y_label, xaxis_title="Tratamiento", title_font=dict(size=16))
+            st.plotly_chart(fig, use_container_width=True)
+
+# ======================== TAB 6: EXPORTAR ========================
+
+with tabs[5]:
+    st.subheader("Exportar")
+
+    if state.report_bytes is None:
+        st.info("Corre el análisis primero para habilitar el reporte.")
+    else:
+        st.download_button(
+            "Descargar reporte Excel",
+            data=state.report_bytes,
+            file_name="pcta_reporte.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
