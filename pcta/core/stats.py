@@ -69,10 +69,10 @@ def _shapiro_min_p(groups: List[np.ndarray], alpha: float) -> Tuple[Optional[flo
             continue
 
     if not pvals:
-        return None, False, "Shapiro skipped for groups with n<3 (or failed)."
+        return None, False, "Shapiro omitido para grupos con n<3 (o falló)."
     min_p = float(min(pvals))
     normal = all(p > alpha for p in pvals)
-    return min_p, normal, "Shapiro run per group where n>=3; stored value is min p across groups."
+    return min_p, normal, "Shapiro por grupo (n>=3). Se reporta el p mínimo."
 
 
 def _levene_p(groups: List[np.ndarray]) -> Optional[float]:
@@ -87,6 +87,10 @@ def _levene_p(groups: List[np.ndarray]) -> Optional[float]:
 
 
 def _holm_adjust(pvals: List[float]) -> List[float]:
+    """
+    Holm step-down adjustment.
+    Returns adjusted p-values in original order.
+    """
     m = len(pvals)
     if m == 0:
         return []
@@ -107,6 +111,9 @@ def _holm_adjust(pvals: List[float]) -> List[float]:
 
 
 def _eta_squared(y: np.ndarray, groups: List[np.ndarray]) -> Optional[float]:
+    """
+    Eta^2 = SS_between / SS_total
+    """
     try:
         grand_mean = float(np.mean(y))
         ss_total = float(np.sum((y - grand_mean) ** 2))
@@ -123,6 +130,9 @@ def _eta_squared(y: np.ndarray, groups: List[np.ndarray]) -> Optional[float]:
 
 
 def _epsilon_squared(h: float, n: int, k: int) -> Optional[float]:
+    """
+    Epsilon^2 for Kruskal-Wallis effect size.
+    """
     if n <= k or k < 2:
         return None
     return float((h - k + 1) / (n - k))
@@ -158,6 +168,22 @@ def analyze_metric(
     """
     warnings: List[AnalysisWarning] = []
 
+    if treatment_col not in df.columns or metric not in df.columns:
+        return (
+            {
+                "metric": metric,
+                "test": None,
+                "p_value": None,
+                "effect_size": None,
+                "assumptions_shapiro_min_p": None,
+                "assumptions_levene_p": None,
+                "assumptions_notes": None,
+                "posthoc": None,
+                "disabled_reason": "Columnas requeridas no presentes en el DataFrame.",
+            },
+            warnings,
+        )
+
     sub = df[[treatment_col, metric]].dropna()
     if sub.empty:
         return (
@@ -168,8 +194,9 @@ def analyze_metric(
                 "effect_size": None,
                 "assumptions_shapiro_min_p": None,
                 "assumptions_levene_p": None,
+                "assumptions_notes": None,
                 "posthoc": None,
-                "disabled_reason": "No data available for metric.",
+                "disabled_reason": "No hay datos para esta variable (todo NA).",
             },
             warnings,
         )
@@ -177,7 +204,7 @@ def analyze_metric(
     rep = _rep_by_treatment(sub, treatment_col)
     min_n = _min_n(rep)
     if min_n < 2:
-        msg = "Inferential statistics disabled due to lack of replication."
+        msg = "Inferencia deshabilitada por falta de replicación (n<2 por tratamiento)."
         warnings.append(
             AnalysisWarning(
                 code=WarningCode.inferential_disabled_no_replication,
@@ -193,6 +220,7 @@ def analyze_metric(
                 "effect_size": None,
                 "assumptions_shapiro_min_p": None,
                 "assumptions_levene_p": None,
+                "assumptions_notes": None,
                 "posthoc": None,
                 "disabled_reason": msg,
             },
@@ -221,13 +249,14 @@ def analyze_metric(
 
     # Choose test
     if normal and homoscedastic:
+        # ANOVA
         try:
             f = sps.f_oneway(*groups)
             result["test"] = "anova"
             result["p_value"] = float(f.pvalue)
             result["effect_size"] = _eta_squared(y, groups)
         except Exception as e:
-            result["disabled_reason"] = f"ANOVA failed: {e}"
+            result["disabled_reason"] = f"ANOVA falló: {e}"
             return result, warnings
 
         if enable_posthoc:
@@ -256,7 +285,7 @@ def analyze_metric(
                 warnings.append(
                     AnalysisWarning(
                         code=WarningCode.validation_adjustment,
-                        message="Posthoc (Tukey HSD) failed; returning omnibus result only.",
+                        message="Posthoc (Tukey HSD) falló; se devuelve solo el omnibus.",
                         context={"metric": metric, "error": str(e)},
                     )
                 )
@@ -280,7 +309,7 @@ def analyze_metric(
             result["df_num"] = float(getattr(welch, "df_num", np.nan))
             result["df_denom"] = float(getattr(welch, "df_denom", np.nan))
         except Exception as e:
-            result["disabled_reason"] = f"Welch ANOVA failed: {e}"
+            result["disabled_reason"] = f"Welch ANOVA falló: {e}"
             return result, warnings
 
         if enable_posthoc:
@@ -297,19 +326,19 @@ def analyze_metric(
 
         return result, warnings
 
-    # Non-normal -> Kruskal
+    # Non-normal -> Kruskal-Wallis
     try:
         h = sps.kruskal(*groups)
         result["test"] = "kruskal"
         result["p_value"] = float(h.pvalue)
         result["effect_size"] = _epsilon_squared(float(h.statistic), int(y.size), len(groups))
     except Exception as e:
-        result["disabled_reason"] = f"Kruskal-Wallis failed: {e}"
+        result["disabled_reason"] = f"Kruskal-Wallis falló: {e}"
         return result, warnings
 
     if enable_posthoc:
-        pairs = []
-        p_raw = []
+        pairs: List[Tuple[str, str]] = []
+        p_raw: List[float] = []
         for a, b in combinations(treatments, 2):
             ga = sub.loc[sub[treatment_col] == a, metric].to_numpy(float)
             gb = sub.loc[sub[treatment_col] == b, metric].to_numpy(float)
@@ -334,7 +363,31 @@ def run_inferential_statistics(
     Returns:
         stats_df, replication_by_treatment (unit counts), min_n_per_treatment, inferential_enabled_overall, warnings
     """
-    df = pd.DataFrame([getattr(x, "model_dump", lambda: x)() for x in unit_kpis])  # support pydantic models or dicts
+    # Supports pydantic models (model_dump) or dicts
+    rows = []
+    for x in unit_kpis:
+        if hasattr(x, "model_dump"):
+            rows.append(x.model_dump())
+        elif isinstance(x, dict):
+            rows.append(x)
+        else:
+            # best-effort
+            rows.append(dict(x))  # type: ignore[arg-type]
+
+    df = pd.DataFrame(rows)
+
+    if "treatment" not in df.columns:
+        rep_all: Dict[str, int] = {}
+        min_n_all = 0
+        enabled_overall = False
+        warnings = [
+            AnalysisWarning(
+                code=WarningCode.validation_adjustment,
+                message="No existe columna 'treatment' en unit_kpis; inferencia deshabilitada.",
+                context={},
+            )
+        ]
+        return pd.DataFrame([]), rep_all, min_n_all, enabled_overall, warnings
 
     rep_all = df.groupby("treatment").size().astype(int).to_dict()
     min_n_all = int(min(rep_all.values())) if rep_all else 0
@@ -345,12 +398,12 @@ def run_inferential_statistics(
         warnings.append(
             AnalysisWarning(
                 code=WarningCode.inferential_disabled_no_replication,
-                message="Inferential statistics disabled due to lack of replication.",
+                message="Inferencia deshabilitada por falta de replicación (n<2 por tratamiento).",
                 context={"replication_by_treatment": rep_all, "min_n_per_treatment": min_n_all},
             )
         )
 
-    rows: List[Dict[str, Any]] = []
+    out_rows: List[Dict[str, Any]] = []
     for metric in metrics:
         res, w = analyze_metric(
             df,
@@ -358,8 +411,8 @@ def run_inferential_statistics(
             alpha=float(options.alpha),
             enable_posthoc=bool(options.enable_posthoc),
         )
-        rows.append(res)
+        out_rows.append(res)
         warnings.extend(w)
 
-    stats_df = pd.DataFrame(rows)
+    stats_df = pd.DataFrame(out_rows)
     return stats_df, rep_all, min_n_all, enabled_overall, warnings
