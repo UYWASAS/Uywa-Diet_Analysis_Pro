@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -42,9 +42,10 @@ def init_state() -> None:
             report_bytes=None,
         )
 
-    # Variable principal elegida por el usuario
-    st.session_state.setdefault("primary_metric", None)
-    st.session_state.setdefault("primary_metric_label", None)
+    # Variable elegida por el usuario (puede ser raw o KPI)
+    st.session_state.setdefault("analysis_variable", None)
+    st.session_state.setdefault("analysis_variable_label", None)
+    st.session_state.setdefault("analysis_source", None)  # "raw" | "kpi"
 
 
 def get_state() -> AppState:
@@ -75,52 +76,14 @@ def warnings_df(warnings: List[AnalysisWarning]) -> pd.DataFrame:
     )
 
 
-def replication_summary(units: List[TrialUnitInput]) -> Dict[str, int]:
-    df = pd.DataFrame([u.model_dump() for u in units])
-    return df.groupby("treatment").size().astype(int).to_dict()
-
-
-def numeric_kpi_columns(unit_kpis_df: pd.DataFrame) -> List[str]:
-    id_cols = {"trial_id", "unit_type", "unit_id", "treatment"}
-    cols = [
-        c
-        for c in unit_kpis_df.columns
-        if c not in id_cols and pd.api.types.is_numeric_dtype(unit_kpis_df[c])
-    ]
-    return cols
-
-
-def describe_by_treatment(df: pd.DataFrame, metric: str) -> pd.DataFrame:
-    if metric not in df.columns:
-        return pd.DataFrame()
-
-    g = (
-        df.groupby("treatment")[metric]
-        .agg(["count", "mean", "std", "min", "median", "max"])
-        .rename(
-            columns={
-                "count": "n",
-                "mean": "media",
-                "std": "sd",
-                "min": "min",
-                "median": "mediana",
-                "max": "max",
-            }
-        )
-        .reset_index()
-    )
-
-    pcts = (
-        df.groupby("treatment")[metric]
-        .quantile([0.25, 0.75])
-        .unstack(level=1)
-        .reset_index()
-        .rename(columns={0.25: "p25", 0.75: "p75"})
-    )
-
-    out = g.merge(pcts, on="treatment", how="left")
-    # ordenar tratamientos alfabéticamente
-    out = out.sort_values("treatment").reset_index(drop=True)
+def numeric_cols(df: pd.DataFrame, *, exclude: Optional[set[str]] = None) -> List[str]:
+    exclude = exclude or set()
+    out = []
+    for c in df.columns:
+        if c in exclude:
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            out.append(c)
     return out
 
 
@@ -133,10 +96,28 @@ def fmt_num(x: object, decimals: int = 2) -> str:
         return str(x)
 
 
-def styled_descriptive_table(desc: pd.DataFrame, decimals: int = 2) -> pd.DataFrame:
-    """
-    Devuelve una tabla ya formateada (strings) para mostrar más agradable.
-    """
+def describe_by_group(df: pd.DataFrame, group_col: str, metric: str) -> pd.DataFrame:
+    if metric not in df.columns or group_col not in df.columns:
+        return pd.DataFrame()
+
+    g = (
+        df.groupby(group_col)[metric]
+        .agg(["count", "mean", "std", "min", "median", "max"])
+        .rename(columns={"count": "n", "mean": "media", "std": "sd", "median": "mediana"})
+        .reset_index()
+    )
+    pcts = (
+        df.groupby(group_col)[metric]
+        .quantile([0.25, 0.75])
+        .unstack(level=1)
+        .reset_index()
+        .rename(columns={0.25: "p25", 0.75: "p75"})
+    )
+    out = g.merge(pcts, on=group_col, how="left").sort_values(group_col).reset_index(drop=True)
+    return out
+
+
+def styled_desc(desc: pd.DataFrame, decimals: int = 2) -> pd.DataFrame:
     if desc.empty:
         return desc
     out = desc.copy()
@@ -144,8 +125,17 @@ def styled_descriptive_table(desc: pd.DataFrame, decimals: int = 2) -> pd.DataFr
         if col in out.columns:
             out[col] = out[col].apply(lambda v: fmt_num(v, decimals=decimals))
     if "n" in out.columns:
-        out["n"] = out["n"].astype(int)
+        out["n"] = out["n"].fillna(0).astype(int)
     return out
+
+
+def numeric_kpi_columns(unit_kpis_df: pd.DataFrame) -> List[str]:
+    id_cols = {"trial_id", "unit_type", "unit_id", "treatment"}
+    return [
+        c
+        for c in unit_kpis_df.columns
+        if c not in id_cols and pd.api.types.is_numeric_dtype(unit_kpis_df[c])
+    ]
 
 
 # ------------------------ Sidebar minimal ------------------------
@@ -179,7 +169,6 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
 
         st.divider()
         st.subheader("Carga de archivos")
-
         uploaded_main = st.file_uploader(
             "Ensayo (Excel .xlsx o CSV .csv)",
             type=["xlsx", "csv"],
@@ -221,7 +210,7 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
         )
 
 
-# ------------------------ Pipeline (correr) ------------------------
+# ------------------------ Pipeline ------------------------
 
 
 def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bool) -> None:
@@ -230,169 +219,149 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
         st.error("Primero carga el archivo principal.")
         return
 
-    try:
-        units = state.parsed.to_units()
+    units = state.parsed.to_units()
+    _, v_warnings = validate_units(units, options=ValidationOptions(wg_negative_is_error=wg_negative_is_error))
 
-        _, v_warnings = validate_units(
-            units, options=ValidationOptions(wg_negative_is_error=wg_negative_is_error)
+    computed, c_warnings = compute_all_units(units)
+    unit_kpis_df = pd.DataFrame([m.model_dump() for m in computed])
+    treatment_summary_df = build_treatment_summary(unit_kpis_df)
+
+    metrics_default = default_metric_list(unit_kpis_df)
+    stats_df, rep_by_trt, min_n, enabled, s_warnings = run_inferential_statistics(
+        computed,
+        metrics=metrics_default,
+        options=StatsOptions(alpha=alpha, enable_posthoc=enable_posthoc),
+    )
+
+    all_warnings = [*v_warnings, *c_warnings, *s_warnings]
+
+    report_bytes = export_report_xlsx(
+        ExportPayload(
+            cleaned_input=state.parsed.cleaned_input,
+            unit_kpis=unit_kpis_df,
+            treatment_summary=treatment_summary_df,
+            stats=stats_df,
+            warnings=warnings_df(all_warnings),
         )
+    )
 
-        computed, c_warnings = compute_all_units(units)
-        unit_kpis_df = pd.DataFrame([m.model_dump() for m in computed])
-
-        treatment_summary_df = build_treatment_summary(unit_kpis_df)
-
-        # Stats por defecto (se recalculará/filtrará en pestaña 3)
-        metrics_default = default_metric_list(unit_kpis_df)
-        stats_df, rep_by_trt, min_n, enabled, s_warnings = run_inferential_statistics(
-            computed,
-            metrics=metrics_default,
-            options=StatsOptions(alpha=alpha, enable_posthoc=enable_posthoc),
-        )
-
-        all_warnings = [*v_warnings, *c_warnings, *s_warnings]
-
-        report_bytes = export_report_xlsx(
-            ExportPayload(
-                cleaned_input=state.parsed.cleaned_input,
-                unit_kpis=unit_kpis_df,
-                treatment_summary=treatment_summary_df,
-                stats=stats_df,
-                warnings=warnings_df(all_warnings),
-            )
-        )
-
-        set_state(
-            units=units,
-            unit_kpis_df=unit_kpis_df,
-            treatment_summary_df=treatment_summary_df,
-            stats_df=stats_df,
-            warnings=all_warnings,
-            report_bytes=report_bytes,
-        )
-        st.success("Análisis completado.")
-    except Exception as e:
-        st.error(f"Falló el análisis: {e}")
-        set_state(
-            units=None,
-            unit_kpis_df=None,
-            treatment_summary_df=None,
-            stats_df=None,
-            warnings=[],
-            report_bytes=None,
-        )
+    set_state(
+        units=units,
+        unit_kpis_df=unit_kpis_df,
+        treatment_summary_df=treatment_summary_df,
+        stats_df=stats_df,
+        warnings=all_warnings,
+        report_bytes=report_bytes,
+    )
 
 
-# ------------------------ TAB 1: Vista previa + variable principal ------------------------
+# ------------------------ TAB 1: Elegir variable + correr ------------------------
 
 
-def tab_preview_and_select_variable() -> None:
-    st.subheader("1) Vista previa + selección de variable principal")
+def tab_1_select_variable_and_run() -> None:
+    st.subheader("1) Selección de variable + correr análisis")
 
     state = get_state()
     if state.parsed is None:
-        st.info("Carga un archivo principal para empezar.")
+        st.info("Carga un archivo en la barra lateral para comenzar.")
         return
 
     dfs = state.parsed.to_dataframes()
-    hs = dfs["house_summary"]
+    hs = dfs["house_summary"].copy()
 
-    st.markdown(
-        f"""
-        <div class="pcta-card">
-          <b>Modo detectado:</b> {state.parsed.mode.value}<br>
-          <span class="pcta-muted">Primero corre el análisis (pestaña 2) para generar KPIs; luego eliges tu variable principal.</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("### Selecciona variable de trabajo (desde HOUSE_SUMMARY)")
+    st.caption("Esta selección funciona ANTES de correr el análisis (input crudo).")
 
-    show_hs = st.toggle("Mostrar HOUSE_SUMMARY", value=False)
-    if show_hs:
-        st.dataframe(hs.head(300), use_container_width=True, hide_index=True)
+    # Variables raw numéricas (excluye IDs)
+    raw_exclude = {"trial_id", "unit_id", "treatment", "unit_type"}
+    raw_numeric = numeric_cols(hs, exclude=raw_exclude)
+
+    if not raw_numeric:
+        st.warning("No se detectaron columnas numéricas en HOUSE_SUMMARY para seleccionar.")
+        return
+
+    # labels amigables para raw (puedes expandir)
+    raw_labels = {
+        "bw_final_mean_g": "Peso vivo final (g)",
+        "bw_initial_mean_g": "Peso vivo inicial (g)",
+        "mortality_total": "Mortalidad total (n)",
+        "feed_delivered_kg": "Alimento entregado (kg)",
+    }
+
+    raw_options = [f"{raw_labels.get(c, c)}  —  ({c})" for c in raw_numeric]
+    default_raw = "bw_final_mean_g" if "bw_final_mean_g" in raw_numeric else raw_numeric[0]
+    idx = raw_numeric.index(default_raw)
+
+    sel = st.selectbox("Variable (raw)", options=raw_options, index=idx, key="sel_raw_var")
+    chosen = raw_numeric[raw_options.index(sel)]
+
+    st.session_state["analysis_variable"] = chosen
+    st.session_state["analysis_variable_label"] = raw_labels.get(chosen, chosen)
+    st.session_state["analysis_source"] = "raw"
+
+    st.success(f"Variable seleccionada: {st.session_state['analysis_variable_label']}")
+
+    with st.expander("Vista previa de datos (opcional)", expanded=False):
+        show = st.toggle("Mostrar tabla HOUSE_SUMMARY", value=False)
+        if show:
+            st.dataframe(hs.head(300), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.markdown("### Variable principal")
-    if state.unit_kpis_df is None:
-        st.warning("Aún no hay KPIs. Ve a la pestaña 2 y corre el análisis.")
-        return
+    st.markdown("### Correr análisis (para habilitar KPIs y test de medias)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True)
+    with c2:
+        alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
+    with c3:
+        enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True)
 
-    kpi_cols = numeric_kpi_columns(state.unit_kpis_df)
-    if not kpi_cols:
-        st.warning("No se detectaron KPIs numéricos para seleccionar.")
-        return
-
-    # Sugerencias "humanas" (puedes expandir luego)
-    labels = {
-        "bw_final_mean_g": "Peso vivo final (g)",
-        "wg_g_per_bird": "Ganancia de peso (g/ave)",
-        "adg_g_per_bird_d": "ADG (g/ave/día)",
-        "fcr": "FCR",
-        "mortality_pct": "Mortalidad (%)",
-    }
-    options_with_labels = [f"{labels.get(c, c)}  —  ({c})" for c in kpi_cols]
-
-    # Resolver default
-    suggested = [c for c in ["bw_final_mean_g", "wg_g_per_bird", "fcr"] if c in kpi_cols]
-    default_metric = st.session_state.get("primary_metric") or (suggested[0] if suggested else kpi_cols[0])
-    default_idx = kpi_cols.index(default_metric)
-
-    sel = st.selectbox("Elige la variable principal de trabajo", options=options_with_labels, index=default_idx)
-    chosen_metric = kpi_cols[options_with_labels.index(sel)]
-    st.session_state["primary_metric"] = chosen_metric
-    st.session_state["primary_metric_label"] = labels.get(chosen_metric, chosen_metric)
-
-    st.success(f"Variable principal seleccionada: {st.session_state['primary_metric_label']}")
-
-
-# ------------------------ TAB 2: Descriptiva + gráficos (variable principal) ------------------------
-
-
-def tab_descriptive_and_charts() -> None:
-    st.subheader("2) Estadística descriptiva + gráficos (variable principal)")
-
-    state = get_state()
-    if state.unit_kpis_df is None:
-        st.info("Corre el análisis primero (en esta misma pestaña, más abajo).")
-    metric = st.session_state.get("primary_metric")
-
-    # Bloque para correr análisis
-    with st.expander("Correr / Re-correr análisis", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True)
-        with c2:
-            alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
-        with c3:
-            enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True)
-
-        if st.button("Correr análisis ahora", type="primary", use_container_width=True):
+    if st.button("Correr análisis ahora", type="primary", use_container_width=True):
+        try:
             run_analysis(alpha=float(alpha), enable_posthoc=bool(enable_posthoc), wg_negative_is_error=bool(wg_negative_is_error))
-            st.rerun()
+            st.success("Listo. Ve a la pestaña 2 para ver resultados.")
+        except Exception as e:
+            st.error(f"No se pudo correr el análisis: {e}")
+
+
+# ------------------------ TAB 2: Resultados de variable (descriptiva + gráficos) ------------------------
+
+
+def tab_2_results_for_selected_variable() -> None:
+    st.subheader("2) Resultados (descriptiva + gráficos) — variable seleccionada")
 
     state = get_state()
-    if state.unit_kpis_df is None:
+    if state.parsed is None:
+        st.info("Carga un archivo primero.")
         return
 
-    # Garantizar variable principal
-    kpi_cols = numeric_kpi_columns(state.unit_kpis_df)
-    if not metric or metric not in kpi_cols:
-        st.warning("Selecciona la variable principal en la pestaña 1.")
+    var = st.session_state.get("analysis_variable")
+    src = st.session_state.get("analysis_source")
+    label = st.session_state.get("analysis_variable_label") or var
+
+    if not var or src != "raw":
+        st.warning("Selecciona la variable en la pestaña 1.")
         return
 
-    label = st.session_state.get("primary_metric_label") or metric
+    hs = state.parsed.to_dataframes()["house_summary"].copy()
+    if "treatment" not in hs.columns:
+        st.error("No existe columna 'treatment' en HOUSE_SUMMARY.")
+        return
 
-    # Cards rápidas
-    df = state.unit_kpis_df
-    n_units = len(df)
-    treatments = sorted(df["treatment"].astype(str).unique().tolist())
+    if var not in hs.columns:
+        st.error(f"La variable seleccionada ({var}) no existe en HOUSE_SUMMARY.")
+        return
+
+    # Cards
+    n_units = int(len(hs))
+    n_trt = int(hs["treatment"].astype(str).nunique())
 
     st.markdown(
         f"""
         <div class="pcta-kpi">
           <div><div class="label">Variable</div><div class="value">{label}</div></div>
           <div><div class="label">Unidades</div><div class="value">{n_units}</div></div>
-          <div><div class="label">Tratamientos</div><div class="value">{len(treatments)}</div></div>
+          <div><div class="label">Tratamientos</div><div class="value">{n_trt}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -400,9 +369,9 @@ def tab_descriptive_and_charts() -> None:
 
     st.divider()
     st.markdown("### Resumen descriptivo por tratamiento")
-    decimals = st.slider("Decimales (descriptiva)", 0, 6, 2)
-    desc = describe_by_treatment(df, metric)
-    st.dataframe(styled_descriptive_table(desc, decimals=decimals), use_container_width=True, hide_index=True)
+    decimals = st.slider("Decimales", 0, 6, 2)
+    desc = describe_by_group(hs, "treatment", var)
+    st.dataframe(styled_desc(desc, decimals=decimals), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Gráficos")
@@ -410,82 +379,85 @@ def tab_descriptive_and_charts() -> None:
     try:
         import plotly.express as px
     except Exception:
-        st.error("No está instalado Plotly. Revisa `pcta/requirements.txt`.")
+        st.error("No está instalado Plotly.")
         return
 
     c1, c2 = st.columns(2)
     with c1:
-        fig1 = px.box(df, x="treatment", y=metric, points="all", template="simple_white", title=f"{label} (distribución)")
+        fig1 = px.box(hs, x="treatment", y=var, points="all", template="simple_white", title=f"{label} (distribución)")
         st.plotly_chart(fig1, use_container_width=True)
-
     with c2:
-        means = df.groupby("treatment", as_index=False)[metric].mean(numeric_only=True)
-        fig2 = px.bar(means, x="treatment", y=metric, template="simple_white", title=f"{label} (media)")
+        means = hs.groupby("treatment", as_index=False)[var].mean(numeric_only=True)
+        fig2 = px.bar(means, x="treatment", y=var, template="simple_white", title=f"{label} (media)")
         st.plotly_chart(fig2, use_container_width=True)
 
 
-# ------------------------ TAB 3: Inferencial (comparación tratamientos) ------------------------
+# ------------------------ TAB 3: Test de medias sobre la variable seleccionada ------------------------
 
 
-def tab_inferential_compare() -> None:
-    st.subheader("3) Comparación de tratamientos (test de medias + gráficos)")
+def tab_3_mean_tests() -> None:
+    st.subheader("3) Test de medias (ANOVA / posthoc) + tratamientos a comparar")
 
     state = get_state()
     if state.units is None or state.unit_kpis_df is None:
-        st.info("Corre el análisis primero.")
+        st.info("Primero corre el análisis en la pestaña 1.")
         return
 
-    metric = st.session_state.get("primary_metric")
-    if not metric or metric not in numeric_kpi_columns(state.unit_kpis_df):
-        st.warning("Selecciona variable principal en la pestaña 1.")
+    # Para test de medias, necesitamos que la variable exista en unit_kpis_df
+    # (porque core.stats trabaja sobre los modelos calculados).
+    # Si el usuario eligió una variable raw que también existe en KPIs, ok.
+    var = st.session_state.get("analysis_variable")
+    label = st.session_state.get("analysis_variable_label") or var
+    if not var:
+        st.warning("Selecciona variable en la pestaña 1.")
         return
 
-    label = st.session_state.get("primary_metric_label") or metric
+    kpi_cols = numeric_kpi_columns(state.unit_kpis_df)
+    if var not in kpi_cols:
+        st.warning(
+            f"La variable seleccionada ({var}) es de input crudo y no está disponible como KPI calculado. "
+            "Para habilitar ANOVA/posthoc, debemos mapear esa variable al KPI equivalente o ampliar core.stats para usar raw."
+        )
+        st.caption("Dime qué variable quieres testear (ej: bw_final_mean_g, fcr, wg_g_per_bird) y lo alineo.")
+        return
 
     treatments_all = sorted(state.unit_kpis_df["treatment"].astype(str).unique().tolist())
-    selected_trts = st.multiselect(
-        "Selecciona tratamientos a comparar",
-        options=treatments_all,
-        default=treatments_all,
-        help="Puedes comparar un subconjunto de tratamientos.",
-    )
+    selected_trts = st.multiselect("Tratamientos a comparar", options=treatments_all, default=treatments_all)
+
     if len(selected_trts) < 2:
         st.warning("Selecciona al menos 2 tratamientos.")
         return
 
     st.divider()
-    st.markdown("### Elegir test de medias")
-    # UI listo; por ahora el core decide automáticamente.
+    st.markdown("### Método")
     test_mode = st.selectbox(
-        "Método (por ahora AUTO)",
+        "Test de medias",
         options=[
-            "AUTO (recomendado)",
-            "ANOVA (pendiente implementación)",
-            "Welch ANOVA (pendiente implementación)",
-            "Kruskal-Wallis (pendiente implementación)",
+            "AUTO (según supuestos)",
+            "ANOVA (pendiente)",
+            "Welch ANOVA (pendiente)",
+            "Kruskal-Wallis (pendiente)",
         ],
         index=0,
-        help="Actualmente el core corre selección automática. Si confirmas, habilito selección real modificando core/stats.py.",
     )
-    enable_posthoc = st.checkbox("Hacer posthoc (si aplica)", value=True)
-    alpha = st.number_input("Alpha (comparación)", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
+    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True)
+    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
 
-    if st.button("Calcular test de medias para la variable principal", type="primary"):
-        # Re-calcular stats SOLO para esa métrica y SOLO para tratamientos seleccionados
+    if st.button("Calcular test de medias", type="primary"):
         try:
             units_filtered = [u for u in state.units if str(u.treatment) in set(selected_trts)]
             computed, _ = compute_all_units(units_filtered)
 
             stats_df, rep_by_trt, min_n, enabled, warnings = run_inferential_statistics(
                 computed,
-                metrics=[metric],
+                metrics=[var],
                 options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
             )
 
-            st.markdown("### Resultado inferencial")
+            st.markdown(f"### Resultado: {label}")
             st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
-            # Gráfico enfocado a tratamientos seleccionados
+            # Gráfico sólo tratamientos seleccionados
             try:
                 import plotly.express as px
             except Exception:
@@ -496,7 +468,7 @@ def tab_inferential_compare() -> None:
             fig = px.box(
                 df[df["treatment"].astype(str).isin(selected_trts)],
                 x="treatment",
-                y=metric,
+                y=var,
                 points="all",
                 template="simple_white",
                 title=f"{label} — tratamientos seleccionados",
@@ -508,7 +480,7 @@ def tab_inferential_compare() -> None:
                 st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
 
         except Exception as e:
-            st.error(f"No se pudo calcular inferencial: {e}")
+            st.error(f"No se pudo calcular el test: {e}")
 
 
 # ------------------------ Export ------------------------
