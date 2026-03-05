@@ -10,23 +10,15 @@ Este archivo contiene:
 - Pestañas: Vista previa, Configuración, Resultados, Estadística, Gráficos, Exportar
 - Helpers UI (toggle de tablas, selección de variable, resumen descriptivo)
 """
+from pcta.core.calculations import compute_all_units
+from pcta.core.io import export_report_xlsx, parse_uploaded_file
+from pcta.core.reporting import build_treatment_summary, default_metric_list
+from pcta.core.schemas import AnalysisWarning, ExportPayload, ParsedInput, TrialUnitInput
+from pcta.core.stats import StatsOptions, run_inferential_statistics
+from pcta.core.validation import ValidationOptions, validate_units
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import pandas as pd
-import streamlit as st
-
-from .core.calculations import compute_all_units
-from .core.io import export_report_xlsx, parse_uploaded_file
-from .core.reporting import build_treatment_summary, default_metric_list
-from .core.schemas import AnalysisWarning, ExportPayload, ParsedInput, TrialUnitInput
-from .core.stats import StatsOptions, run_inferential_statistics
-from .core.validation import ValidationOptions, validate_units
-
+# y dentro de render_sidebar_minimal:
+from pcta.auth import logout_button
 
 # ------------------------ Estado ------------------------
 
