@@ -10,6 +10,17 @@ Este archivo contiene:
 - Pestañas: Vista previa, Configuración, Resultados, Estadística, Gráficos, Exportar
 - Helpers UI (toggle de tablas, selección de variable, resumen descriptivo)
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+import streamlit as st
+
+from pcta.auth import logout_button
 from pcta.core.calculations import compute_all_units
 from pcta.core.io import export_report_xlsx, parse_uploaded_file
 from pcta.core.reporting import build_treatment_summary, default_metric_list
@@ -17,8 +28,6 @@ from pcta.core.schemas import AnalysisWarning, ExportPayload, ParsedInput, Trial
 from pcta.core.stats import StatsOptions, run_inferential_statistics
 from pcta.core.validation import ValidationOptions, validate_units
 
-# y dentro de render_sidebar_minimal:
-from pcta.auth import logout_button
 
 # ------------------------ Estado ------------------------
 
@@ -70,7 +79,9 @@ def set_state(**kwargs) -> None:
 def warnings_df(warnings: List[AnalysisWarning]) -> pd.DataFrame:
     if not warnings:
         return pd.DataFrame(columns=["codigo", "mensaje", "contexto"])
-    return pd.DataFrame([{"codigo": w.code.value, "mensaje": w.message, "contexto": w.context} for w in warnings])
+    return pd.DataFrame(
+        [{"codigo": w.code.value, "mensaje": w.message, "contexto": w.context} for w in warnings]
+    )
 
 
 def replication_summary(units: List[TrialUnitInput]) -> Dict[str, int]:
@@ -112,7 +123,6 @@ def describe_by_treatment(df: pd.DataFrame, metric: str) -> pd.DataFrame:
         .reset_index()
     )
 
-    # percentiles
     pcts = (
         df.groupby("treatment")[metric]
         .quantile([0.25, 0.75])
@@ -153,9 +163,7 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
             unsafe_allow_html=True,
         )
 
-        # Solo cerrar sesión + carga de archivos (según requerimiento)
-        from .auth import logout_button
-
+        # Solo cerrar sesión + carga de archivos
         logout_button()
 
         st.divider()
@@ -185,7 +193,6 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
     """
     Si subieron archivo principal, lo parsea y guarda `parsed` en el estado.
     """
-    state = get_state()
     if uploaded_main is None:
         return
 
@@ -241,7 +248,6 @@ def tab_preview() -> None:
         unsafe_allow_html=True,
     )
 
-    # Toggle para ocultar/mostrar tablas (requerimiento)
     st.markdown("### Mostrar/Ocultar tablas")
     show_hs = st.toggle("Mostrar HOUSE_SUMMARY", value=True)
     show_ws = st.toggle("Mostrar WEIGH_SAMPLES (si existe)", value=False)
@@ -293,13 +299,18 @@ def tab_config_and_run(*, uploaded_costs_extra: Optional[object]) -> None:
     state = get_state()
 
     colA, colB = st.columns(2)
-
     with colA:
         st.markdown("### Validación")
         wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True)
     with colB:
         st.markdown("### Estadística")
-        alpha = st.number_input("Nivel de significancia (alpha)", min_value=0.001, max_value=0.2, value=0.05, step=0.005)
+        alpha = st.number_input(
+            "Nivel de significancia (alpha)",
+            min_value=0.001,
+            max_value=0.2,
+            value=0.05,
+            step=0.005,
+        )
         enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True)
 
     st.divider()
@@ -319,12 +330,20 @@ def tab_config_and_run(*, uploaded_costs_extra: Optional[object]) -> None:
         st.caption("Estos valores se aplican a TODOS los tratamientos/unidades (modo simple).")
         c1, c2, c3 = st.columns(3)
         with c1:
-            manual_costs["diet_cost_per_kg"] = float(st.number_input("Costo alimento (USD/kg)", min_value=0.0, value=0.0, step=0.01))
+            manual_costs["diet_cost_per_kg"] = float(
+                st.number_input("Costo alimento (USD/kg)", min_value=0.0, value=0.0, step=0.01)
+            )
         with c2:
-            manual_costs["chick_cost_per_bird"] = float(st.number_input("Costo pollito (USD/ave)", min_value=0.0, value=0.0, step=0.01))
+            manual_costs["chick_cost_per_bird"] = float(
+                st.number_input("Costo pollito (USD/ave)", min_value=0.0, value=0.0, step=0.01)
+            )
         with c3:
-            manual_costs["additive_cost_total"] = float(st.number_input("Aditivos total (USD / unidad)", min_value=0.0, value=0.0, step=1.0))
-        manual_costs["other_variable_costs_total"] = float(st.number_input("Otros costos variables (USD / unidad)", min_value=0.0, value=0.0, step=1.0))
+            manual_costs["additive_cost_total"] = float(
+                st.number_input("Aditivos total (USD / unidad)", min_value=0.0, value=0.0, step=1.0)
+            )
+        manual_costs["other_variable_costs_total"] = float(
+            st.number_input("Otros costos variables (USD / unidad)", min_value=0.0, value=0.0, step=1.0)
+        )
 
     st.divider()
     st.markdown("### Variables a analizar")
@@ -341,7 +360,12 @@ def tab_config_and_run(*, uploaded_costs_extra: Optional[object]) -> None:
         )
 
     st.divider()
-    run_btn = st.button("Correr análisis", type="primary", use_container_width=True, disabled=(state.parsed is None))
+    run_btn = st.button(
+        "Correr análisis",
+        type="primary",
+        use_container_width=True,
+        disabled=(state.parsed is None),
+    )
 
     if run_btn:
         run_analysis(
@@ -365,7 +389,9 @@ def apply_manual_costs_to_units(units: List[TrialUnitInput], costs: Dict[str, fl
                     "diet_cost_per_kg": costs.get("diet_cost_per_kg", u.diet_cost_per_kg),
                     "additive_cost_total": costs.get("additive_cost_total", u.additive_cost_total),
                     "chick_cost_per_bird": costs.get("chick_cost_per_bird", u.chick_cost_per_bird),
-                    "other_variable_costs_total": costs.get("other_variable_costs_total", u.other_variable_costs_total),
+                    "other_variable_costs_total": costs.get(
+                        "other_variable_costs_total", u.other_variable_costs_total
+                    ),
                 }
             )
         )
@@ -395,17 +421,15 @@ def run_analysis(cfg: RunConfig) -> None:
                 },
             )
 
-        # Validación
-        _, v_warnings = validate_units(units, options=ValidationOptions(wg_negative_is_error=cfg.wg_negative_is_error))
+        _, v_warnings = validate_units(
+            units, options=ValidationOptions(wg_negative_is_error=cfg.wg_negative_is_error)
+        )
 
-        # KPIs
         computed, c_warnings = compute_all_units(units)
         unit_kpis_df = pd.DataFrame([m.model_dump() for m in computed])
 
-        # Summary descriptivo general
         treatment_summary_df = build_treatment_summary(unit_kpis_df)
 
-        # Stats: usar variables seleccionadas si existen, si no default
         metrics = cfg.metrics_selected or default_metric_list(unit_kpis_df)
 
         stats_df, rep_by_trt, min_n, enabled, s_warnings = run_inferential_statistics(
@@ -447,7 +471,7 @@ def run_analysis(cfg: RunConfig) -> None:
         )
 
 
-# ------------------------ Pestaña 3: Resultados (tabla + resumen) ------------------------
+# ------------------------ Pestaña 3: Resultados ------------------------
 
 
 def tab_results() -> None:
@@ -483,7 +507,7 @@ def tab_results() -> None:
         st.dataframe(state.treatment_summary_df, use_container_width=True, hide_index=True)
 
 
-# ------------------------ Pestaña 4: Estadística descriptiva por variable + inferencial ------------------------
+# ------------------------ Pestaña 4: Estadística ------------------------
 
 
 def tab_stats() -> None:
@@ -541,7 +565,9 @@ def tab_charts() -> None:
     with c1:
         metric = st.selectbox("Variable (KPI)", options=kpi_cols, index=0, key="chart_metric")
     with c2:
-        chart_type = st.selectbox("Tipo de gráfico", options=["Boxplot", "Violín", "Barras (media)"], index=0, key="chart_type")
+        chart_type = st.selectbox(
+            "Tipo de gráfico", options=["Boxplot", "Violín", "Barras (media)"], index=0, key="chart_type"
+        )
     with c3:
         scale = st.selectbox("Escala", options=["Lineal", "Log"], index=0, key="chart_scale")
 
@@ -562,12 +588,33 @@ def tab_charts() -> None:
         y_label = metric
 
     if chart_type == "Boxplot":
-        fig = px.box(df, x="treatment", y=y_plot, points="all", template="simple_white", title=f"{y_label} por tratamiento")
+        fig = px.box(
+            df,
+            x="treatment",
+            y=y_plot,
+            points="all",
+            template="simple_white",
+            title=f"{y_label} por tratamiento",
+        )
     elif chart_type == "Violín":
-        fig = px.violin(df, x="treatment", y=y_plot, box=True, points="all", template="simple_white", title=f"{y_label} por tratamiento")
+        fig = px.violin(
+            df,
+            x="treatment",
+            y=y_plot,
+            box=True,
+            points="all",
+            template="simple_white",
+            title=f"{y_label} por tratamiento",
+        )
     else:
         means = df.groupby("treatment", as_index=False)[y_plot].mean(numeric_only=True)
-        fig = px.bar(means, x="treatment", y=y_plot, template="simple_white", title=f"Media de {y_label} por tratamiento")
+        fig = px.bar(
+            means,
+            x="treatment",
+            y=y_plot,
+            template="simple_white",
+            title=f"Media de {y_label} por tratamiento",
+        )
 
     if scale == "Log":
         fig.update_yaxes(type="log")
