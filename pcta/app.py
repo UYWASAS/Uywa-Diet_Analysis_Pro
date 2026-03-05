@@ -5,12 +5,9 @@ Este archivo queda minimalista: login, estilo, sidebar, tabs.
 El resto vive en pcta/app_sections.py para que puedas editar por bloques.
 """
 
-from __future__ import annotations
-
-import streamlit as st
-
-from auth import get_current_user, login_ui
-from app_sections import (
+# reemplaza estos imports
+from pcta.auth import get_current_user, login_ui
+from pcta.app_sections import (
     init_state,
     maybe_parse_main_upload,
     render_sidebar_minimal,
