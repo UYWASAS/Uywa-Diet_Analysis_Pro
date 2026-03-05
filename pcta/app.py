@@ -3,11 +3,27 @@ Entry point (pequeño) para Streamlit.
 
 Este archivo queda minimalista: login, estilo, sidebar, tabs.
 El resto vive en pcta/app_sections.py para que puedas editar por bloques.
+
+IMPORTANTE (Streamlit Cloud / ejecución como script):
+- Streamlit ejecuta `pcta/app.py` como script y a veces NO agrega la raíz del repo al sys.path.
+- Este archivo agrega un "bootstrap" para que `import pcta.*` funcione siempre.
 """
 
-# reemplaza estos imports
-from pcta.auth import get_current_user, login_ui
-from pcta.app_sections import (
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import streamlit as st
+
+# --- Bootstrap de imports (evita: ModuleNotFoundError: No module named 'pcta') ---
+REPO_ROOT = Path(__file__).resolve().parents[1]  # raíz del repo (carpeta padre de pcta/)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Ahora sí: imports del paquete
+from pcta.auth import get_current_user, login_ui  # noqa: E402
+from pcta.app_sections import (  # noqa: E402
     init_state,
     maybe_parse_main_upload,
     render_sidebar_minimal,
