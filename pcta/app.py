@@ -2,6 +2,7 @@
 PCTA - Poultry Commercial Trial Analyzer (Streamlit)
 
 UI:
+- Login (multi-user, similar to the user's pet app)
 - Upload Excel/CSV
 - Preview raw/cleaned inputs
 - Validate + warnings
@@ -13,18 +14,20 @@ CRITICAL SAFETY:
 - Inferential statistics are disabled if min replication per treatment < 2 (handled in core.stats).
 
 Branding/theming:
-- Sidebar branding block with logo placeholder and company text
-- Global CSS to match a "corporate" style (gradient background, dark sidebar, rounded buttons)
+- Sidebar branding block with logo (pcta/assets/logo.png)
+- Global CSS to match corporate style (gradient background, dark sidebar, rounded buttons)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
+from auth import get_current_user, login_ui, logout_button
 from core.calculations import compute_all_units
 from core.io import export_report_xlsx, parse_uploaded_file
 from core.reporting import build_treatment_summary, default_metric_list
@@ -48,10 +51,27 @@ st.markdown(
     /* Sidebar */
     section[data-testid="stSidebar"] {
         background-color: #2C3E50 !important;
+    }
+
+    /* Sidebar text ONLY (avoid overriding widgets too aggressively) */
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] small {
         color: #fff !important;
     }
-    section[data-testid="stSidebar"] * {
+
+    /* Sidebar inputs: ensure contrast */
+    section[data-testid="stSidebar"] input,
+    section[data-testid="stSidebar"] textarea,
+    section[data-testid="stSidebar"] select {
+        background: rgba(255,255,255,0.10) !important;
         color: #fff !important;
+        border: 1px solid rgba(255,255,255,0.25) !important;
+        border-radius: 8px !important;
     }
 
     /* Buttons */
@@ -61,20 +81,12 @@ st.markdown(
         border-radius: 8px !important;
         border: none !important;
         padding: 0.55rem 1.0rem !important;
-        font-weight: 600 !important;
+        font-weight: 700 !important;
     }
     .stButton > button:hover, .stDownloadButton > button:hover {
         background-color: #1254d1 !important;
         color: #fff !important;
         box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.18) !important;
-    }
-
-    /* Inputs */
-    .stNumberInput, .stSelectbox, .stTextInput, .stDateInput {
-        background-color: #eef4fc !important;
-        border-radius: 6px !important;
-        border: 1px solid #d4e4fc !important;
-        padding: 0.25rem;
     }
 
     /* Main container padding */
@@ -85,13 +97,20 @@ st.markdown(
     /* Hide Streamlit footer */
     footer {visibility: hidden !important;}
 
-    /* Small “card” look */
+    /* Cards */
     .pcta-card {
         background: #ffffff;
         border: 1px solid #e6eefb;
         border-radius: 14px;
         padding: 16px 18px;
         box-shadow: 0px 2px 10px rgba(16, 24, 40, 0.06);
+    }
+
+    .pcta-card-dark {
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.18);
+        border-radius: 14px;
+        padding: 12px 14px;
     }
 
     .pcta-muted {
@@ -116,13 +135,13 @@ st.markdown(
     .pcta-kpi .label{
         font-size: 0.82rem;
         color:#334155;
-        font-weight:600;
+        font-weight:700;
         margin-bottom:4px;
     }
     .pcta-kpi .value{
         font-size: 1.25rem;
         color:#0f172a;
-        font-weight:800;
+        font-weight:900;
         letter-spacing: -0.01em;
     }
     </style>
@@ -130,7 +149,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ======================== BLOQUE 2: ESTADO DE SESIÓN ========================
+# ======================== BLOQUE 2: LOGIN GATE ========================
+
+if not st.session_state.get("logged_in", False):
+    login_ui()
+
+user = get_current_user()
+if not user:
+    # Extra safety; login_ui should st.stop() already.
+    st.error("El usuario no está autenticado.")
+    st.stop()
+
+# ======================== BLOQUE 3: ESTADO DE SESIÓN ========================
 
 
 @dataclass(frozen=True)
@@ -175,9 +205,7 @@ def _set_state(**kwargs) -> None:
 def _warnings_df(warnings: List[AnalysisWarning]) -> pd.DataFrame:
     if not warnings:
         return pd.DataFrame(columns=["code", "message", "context"])
-    return pd.DataFrame(
-        [{"code": w.code.value, "message": w.message, "context": w.context} for w in warnings]
-    )
+    return pd.DataFrame([{"code": w.code.value, "message": w.message, "context": w.context} for w in warnings])
 
 
 def _replication_summary(units: List[TrialUnitInput]) -> Dict[str, int]:
@@ -188,42 +216,55 @@ def _replication_summary(units: List[TrialUnitInput]) -> Dict[str, int]:
 _init_state()
 state: AppState = st.session_state["pcta_state"]
 
-# ======================== BLOQUE 3: SIDEBAR CORPORATIVO ========================
+# ======================== BLOQUE 4: SIDEBAR CORPORATIVO ========================
 
 with st.sidebar:
-    # Logo placeholder: user can create pcta/assets/logo.png if desired
-    # Streamlit will not crash if the file is missing; we guard it.
-    try:
-        st.image("assets/logo.png", use_container_width=True)
-    except Exception:
+    # Logo: pcta/assets/logo.png (robust path)
+    logo_path = Path(__file__).resolve().parent / "assets" / "logo.png"
+    if logo_path.exists():
+        st.image(str(logo_path), use_container_width=True)
+    else:
         st.markdown(
             """
-            <div class="pcta-card" style="background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.18);">
-              <div style="text-align:center; font-weight:800; font-size: 1.05rem;">PCTA</div>
-              <div style="text-align:center; font-size: 0.85rem; opacity:0.9;">Poultry Commercial Trial Analyzer</div>
+            <div class="pcta-card-dark">
+              <div style="text-align:center; font-weight:900; font-size: 1.05rem; color:#fff;">PCTA</div>
+              <div style="text-align:center; font-size: 0.85rem; opacity:0.95; color:#fff;">Poultry Commercial Trial Analyzer</div>
+              <div style="text-align:center; font-size: 0.78rem; opacity:0.85; margin-top:6px; color:#fff;">
+                Logo missing: expected <code style="color:#fff;">pcta/assets/logo.png</code>
+              </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     st.markdown(
-        """
+        f"""
         <div style="text-align:center; margin-top: 10px; margin-bottom: 10px;">
             <h2 style="font-family:Montserrat,system-ui,sans-serif; margin:0; color:#fff;">
-                PCTA
+                UYWA Nutrition
             </h2>
             <p style="font-size:13px; margin:0; color:#fff; opacity:0.95;">
-                Commercial Trial Analytics • Evidence-Based
+                Nutrición de Precisión • Evidencia
             </p>
             <br>
             <hr style="border:1px solid rgba(255,255,255,0.35);">
-            <p style="font-size:12px; color:#fff; margin:0;">support@example.com</p>
-            <p style="font-size:11px; color:#fff; margin:0; opacity:0.85;">© 2026 — All rights reserved</p>
+            <p style="font-size:12px; color:#fff; margin:0;">
+                Usuario: <b>{user.get("name","")}</b>
+            </p>
+            <p style="font-size:11px; color:#fff; margin:0; opacity:0.85;">
+                Rol: {user.get("role","")} • {"Premium" if user.get("premium", False) else "Standard"}
+            </p>
+            <p style="font-size:11px; color:#fff; margin:0; opacity:0.85;">
+                © 2026 — Derechos reservados
+            </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    logout_button()
+
+    st.divider()
     st.subheader("Upload")
     uploaded = st.file_uploader(
         "Excel (.xlsx) or CSV (.csv)",
@@ -257,17 +298,17 @@ with st.sidebar:
     else:
         st.caption("Run analysis to enable export.")
 
-# ======================== BLOQUE 4: HEADER + TABS ========================
+# ======================== BLOQUE 5: HEADER + TABS ========================
 
 st.title("PCTA — Poultry Commercial Trial Analyzer")
 st.markdown(
-    "<div class='pcta-muted'>Upload your trial data, validate it, compute KPIs, compare treatments, and export a report.</div>",
+    "<div class='pcta-muted'>Carga datos de ensayo, valida, calcula KPIs, compara tratamientos y exporta reporte.</div>",
     unsafe_allow_html=True,
 )
 
 tabs = st.tabs(["1) Preview", "2) Validation", "3) KPIs", "4) Stats", "5) Export & Notes"])
 
-# ======================== BLOQUE 5: PARSE (ON UPLOAD) ========================
+# ======================== BLOQUE 6: PARSE (ON UPLOAD) ========================
 
 if uploaded is not None:
     try:
@@ -371,16 +412,20 @@ with tabs[2]:
 
         id_cols = {"trial_id", "unit_type", "unit_id", "treatment"}
         metric_options = [
-            c for c in state.unit_kpis_df.columns
+            c
+            for c in state.unit_kpis_df.columns
             if c not in id_cols and pd.api.types.is_numeric_dtype(state.unit_kpis_df[c])
         ]
         if not metric_options:
             st.warning("No numeric KPI columns available to chart.")
         else:
             default_metric = "fcr" if "fcr" in metric_options else metric_options[0]
-            metric = st.selectbox("Metric to visualize", options=metric_options, index=metric_options.index(default_metric))
+            metric = st.selectbox(
+                "Metric to visualize",
+                options=metric_options,
+                index=metric_options.index(default_metric),
+            )
 
-            # KPIs quick cards
             g = state.unit_kpis_df
             n_units = int(len(g))
             treatments = sorted(set(g["treatment"].astype(str).tolist()))
@@ -396,9 +441,8 @@ with tabs[2]:
                 unsafe_allow_html=True,
             )
 
-            # Figures
             try:
-                import plotly.express as px  # requires plotly in requirements.txt
+                import plotly.express as px
             except Exception:
                 st.error("Plotly is not installed. Add `plotly` to requirements.txt to enable charts.")
                 st.stop()
@@ -414,11 +458,7 @@ with tabs[2]:
                     title=f"Distribution by treatment: {metric}",
                     template="simple_white",
                 )
-                fig.update_layout(
-                    title_font=dict(size=16),
-                    xaxis_title="Treatment",
-                    yaxis_title=metric,
-                )
+                fig.update_layout(title_font=dict(size=16), xaxis_title="Treatment", yaxis_title=metric)
                 st.plotly_chart(fig, use_container_width=True)
 
             with c2:
@@ -434,11 +474,7 @@ with tabs[2]:
                     title=f"Mean by treatment: {metric}",
                     template="simple_white",
                 )
-                fig2.update_layout(
-                    title_font=dict(size=16),
-                    xaxis_title="Treatment",
-                    yaxis_title=metric,
-                )
+                fig2.update_layout(title_font=dict(size=16), xaxis_title="Treatment", yaxis_title=metric)
                 st.plotly_chart(fig2, use_container_width=True)
 
 # ======================== TAB 4: STATS ========================
@@ -479,28 +515,23 @@ with tabs[4]:
     if state.report_bytes is None:
         st.caption("Run analysis to enable export.")
 
-# ======================== BLOQUE 6: RUN PIPELINE ========================
+# ======================== BLOQUE 7: RUN PIPELINE ========================
 
 if run_btn:
     if state.parsed is None:
         st.error("Upload a file first.")
     else:
         try:
-            # Build canonical units from parsed input
             units = state.parsed.to_units()
 
-            # Validate
             v_opts = ValidationOptions(wg_negative_is_error=bool(wg_negative_is_error))
             _, v_warnings = validate_units(units, options=v_opts)
 
-            # Compute KPIs
             computed, c_warnings = compute_all_units(units)
             unit_kpis_df = pd.DataFrame([m.model_dump() for m in computed])
 
-            # Treatment descriptive summary
             treatment_summary_df = build_treatment_summary(unit_kpis_df)
 
-            # Stats (safe; stats module enforces replication rule)
             metrics = default_metric_list(unit_kpis_df)
             s_opts = StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc))
             stats_df, rep_by_trt, min_n, enabled, s_warnings = run_inferential_statistics(
@@ -509,11 +540,9 @@ if run_btn:
                 options=s_opts,
             )
 
-            # Merge warnings
             all_warnings = [*v_warnings, *c_warnings, *s_warnings]
 
-            # Build report bytes
-            from core.schemas import ExportPayload  # payload model lives in schemas.py
+            from core.schemas import ExportPayload
 
             report_bytes = export_report_xlsx(
                 ExportPayload(
