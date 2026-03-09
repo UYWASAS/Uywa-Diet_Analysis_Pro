@@ -70,6 +70,29 @@ def set_state(**kwargs) -> None:
 # ------------------------ Helpers ------------------------
 
 
+def _inject_table_css() -> None:
+    """
+    CSS suave para mejorar apariencia de st.dataframe sin depender de pandas Styler.
+    """
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDataFrame"] {
+          border: 1px solid #e6eefb;
+          border-radius: 12px;
+          overflow: hidden;
+        }
+        div[data-testid="stDataFrame"] thead tr th {
+          background: #f3f7ff !important;
+          color: #0f172a !important;
+          font-weight: 700 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def warnings_df(warnings: List[AnalysisWarning]) -> pd.DataFrame:
     if not warnings:
         return pd.DataFrame(columns=["codigo", "mensaje", "contexto"])
@@ -87,15 +110,6 @@ def numeric_cols(df: pd.DataFrame, *, exclude: Optional[set[str]] = None) -> Lis
         if pd.api.types.is_numeric_dtype(df[c]):
             out.append(c)
     return out
-
-
-def fmt_num(x: object, decimals: int = 2) -> str:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return ""
-        return f"{float(x):,.{decimals}f}"
-    except Exception:
-        return str(x)
 
 
 def describe_by_group(df: pd.DataFrame, group_col: str, metric: str) -> pd.DataFrame:
@@ -171,7 +185,7 @@ def _homogeneity_tests(df: pd.DataFrame, group_col: str, metric: str) -> Dict[st
     if sub.empty:
         return {"levene_p": None, "shapiro_min_p": None, "notes": "Sin datos."}
 
-    groups = []
+    groups: List[np.ndarray] = []
     shapiro_pvals: List[float] = []
 
     for _, g in sub.groupby(group_col):
@@ -196,6 +210,27 @@ def _homogeneity_tests(df: pd.DataFrame, group_col: str, metric: str) -> Dict[st
     notes.append("Levene (mediana) evalúa homogeneidad de varianzas (p>0.05 sugiere varianzas similares).")
     notes.append("Shapiro (p>0.05) sugiere normalidad; se reporta el p mínimo entre tratamientos (si n>=3).")
     return {"levene_p": levene_p, "shapiro_min_p": shapiro_min_p, "notes": " ".join(notes)}
+
+
+def _correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, object]:
+    """
+    Correlación entre 2 variables:
+    - method: "pearson" | "spearman"
+    - devuelve r, r2, p_value, n
+    """
+    df = pd.DataFrame({"x": x, "y": y}).dropna()
+    n = int(len(df))
+    if n < 3:
+        return {"n": n, "r": None, "r2": None, "p_value": None, "note": "Se requieren al menos 3 pares válidos."}
+
+    if method == "pearson":
+        r, p = sps.pearsonr(df["x"].to_numpy(float), df["y"].to_numpy(float))
+    else:
+        r, p = sps.spearmanr(df["x"].to_numpy(float), df["y"].to_numpy(float))
+
+    r = float(r)
+    p = float(p)
+    return {"n": n, "r": r, "r2": float(r * r), "p_value": p, "note": ""}
 
 
 def numeric_kpi_columns(unit_kpis_df: pd.DataFrame) -> List[str]:
@@ -421,11 +456,12 @@ def tab_1_select_variable_and_run() -> None:
         st.success("Listo. Ve a la pestaña 2 para ver resultados.")
 
 
-# ------------------------ TAB 2: Resultados (MEJORADO) ------------------------
+# ------------------------ TAB 2: Resultados (MEJORADO + CORRELACIÓN) ------------------------
 
 
 def tab_2_results_for_selected_variable() -> None:
     st.subheader("2) Resultados (descriptiva + gráficos) — variable seleccionada")
+    _inject_table_css()
 
     state = get_state()
     if state.parsed is None:
@@ -448,58 +484,57 @@ def tab_2_results_for_selected_variable() -> None:
         st.error(f"La variable seleccionada ({var}) no existe en HOUSE_SUMMARY.")
         return
 
+    # Cards (más tipo dashboard)
     n_units = int(len(hs))
     treatments = sorted(hs["treatment"].astype(str).unique().tolist())
     n_trt = int(len(treatments))
     missing = int(hs[var].isna().sum())
     valid = int(hs[var].notna().sum())
 
-    st.markdown(
-        f"""
-        <div class="pcta-kpi">
-          <div><div class="label">Variable</div><div class="value">{label}</div></div>
-          <div><div class="label">Unidades</div><div class="value">{n_units}</div></div>
-          <div><div class="label">Tratamientos</div><div class="value">{n_trt}</div></div>
-          <div><div class="label">Valores válidos</div><div class="value">{valid}</div></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Variable", str(label))
+    c2.metric("Unidades", str(n_units))
+    c3.metric("Tratamientos", str(n_trt))
+    c4.metric("Válidos", str(valid))
 
+    # Tabla de datos (auditoría)
     st.divider()
-    st.markdown("### Tabla de datos (variable seleccionada)")
+    st.markdown("### Datos de la variable seleccionada")
+
     cols_show = [c for c in ["trial_id", "unit_id", "unit_type", "treatment"] if c in hs.columns] + [var]
     data_view = hs[cols_show].copy()
+    sort_cols = [c for c in ["treatment", "unit_id"] if c in data_view.columns]
+    if sort_cols:
+        data_view = data_view.sort_values(sort_cols, kind="stable")
 
-    show_data = st.toggle("Mostrar tabla de datos", value=True, key="tab2_show_data_table")
-    if show_data:
+    with st.expander("Ver tabla de datos", expanded=True):
         st.dataframe(data_view, use_container_width=True, hide_index=True)
 
+    # Resumen descriptivo
     st.divider()
     st.markdown("### Resumen descriptivo por tratamiento (mejorado)")
-    c1, c2 = st.columns([1, 2])
-    with c1:
+
+    topL, topR = st.columns([1, 2])
+    with topL:
         decimals = st.slider("Decimales", 0, 6, 2, key="tab2_desc_decimals")
-    with c2:
+    with topR:
         st.caption("Incluye: Media, SD, CV%, percentiles (P10/P25/P75/P90), rango.")
 
     desc = describe_by_group(hs, "treatment", var)
     desc_fmt = _format_desc_table(desc, group_col="treatment", decimals=decimals)
     st.dataframe(desc_fmt, use_container_width=True, hide_index=True)
 
+    # Supuestos (informativo)
     st.divider()
     st.markdown("### Supuestos (informativo)")
     tests = _homogeneity_tests(hs, "treatment", var)
-
-    cA, cB, cC = st.columns(3)
-    with cA:
-        st.metric("Levene p (varianzas)", value=("—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}"))
-    with cB:
-        st.metric("Shapiro min p", value=("—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}"))
-    with cC:
-        st.metric("NA (faltantes)", value=str(missing))
+    a, b, c = st.columns(3)
+    a.metric("Levene p (varianzas)", "—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}")
+    b.metric("Shapiro min p", "—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}")
+    c.metric("NA (faltantes)", str(missing))
     st.caption(str(tests["notes"]))
 
+    # Gráficos
     st.divider()
     st.markdown("### Gráficos")
 
@@ -511,7 +546,7 @@ def tab_2_results_for_selected_variable() -> None:
 
     chart_type = st.radio(
         "Tipo de gráfico",
-        options=["Box (con puntos)", "Violín", "Barras (media)"],
+        options=["Box (con puntos)", "Violín", "Barras (media)", "Dispersión (todas las unidades)"],
         horizontal=True,
         key="tab2_chart_type",
     )
@@ -522,9 +557,11 @@ def tab_2_results_for_selected_variable() -> None:
             fig1 = px.box(hs, x="treatment", y=var, points="all", template="simple_white", title=f"{label} — distribución")
         elif chart_type == "Violín":
             fig1 = px.violin(hs, x="treatment", y=var, box=True, points="all", template="simple_white", title=f"{label} — distribución")
-        else:
+        elif chart_type == "Barras (media)":
             means = hs.groupby("treatment", as_index=False)[var].mean(numeric_only=True)
             fig1 = px.bar(means, x="treatment", y=var, template="simple_white", title=f"{label} — media")
+        else:
+            fig1 = px.scatter(hs, x="treatment", y=var, template="simple_white", title=f"{label} — dispersión por tratamiento")
         st.plotly_chart(fig1, use_container_width=True)
 
     with col2:
@@ -532,6 +569,73 @@ def tab_2_results_for_selected_variable() -> None:
         agg = agg.rename(columns={"mean": "media", "std": "sd", "count": "n"})
         fig2 = px.bar(agg, x="treatment", y="media", error_y="sd", template="simple_white", title=f"{label} — media ± SD")
         st.plotly_chart(fig2, use_container_width=True)
+
+    # Correlación 2x2 (población completa o filtrada por tratamientos)
+    st.divider()
+    st.markdown("### Correlación entre variables (2×2)")
+
+    numeric_candidates = numeric_cols(hs, exclude={"trial_id", "unit_id", "unit_type"})
+    if len(numeric_candidates) < 2:
+        st.info("No hay suficientes variables numéricas para correlación.")
+        return
+
+    scope = st.radio(
+        "Alcance de la correlación",
+        options=["Toda la población", "Filtrar por tratamientos"],
+        horizontal=True,
+        key="corr_scope",
+    )
+
+    if scope == "Filtrar por tratamientos":
+        selected_trts = st.multiselect(
+            "Tratamientos incluidos",
+            options=treatments,
+            default=treatments,
+            key="corr_trts",
+        )
+        if len(selected_trts) == 0:
+            st.warning("Selecciona al menos un tratamiento.")
+            return
+        df_corr_base = hs[hs["treatment"].astype(str).isin(set(selected_trts))].copy()
+    else:
+        df_corr_base = hs
+
+    cL, cM, cR = st.columns([1, 1, 1])
+    with cL:
+        x_var = st.selectbox("Variable X", options=numeric_candidates, index=0, key="corr_x")
+    with cM:
+        default_y = 1 if len(numeric_candidates) > 1 else 0
+        y_var = st.selectbox("Variable Y", options=numeric_candidates, index=default_y, key="corr_y")
+    with cR:
+        method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
+
+    if x_var == y_var:
+        st.warning("Selecciona dos variables diferentes (X ≠ Y).")
+        return
+
+    corr = _correlation_stats(df_corr_base[x_var], df_corr_base[y_var], method=method)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("n (pares)", str(corr["n"]))
+    k2.metric("r", "—" if corr["r"] is None else f"{corr['r']:.4f}")
+    k3.metric("r²", "—" if corr["r2"] is None else f"{corr['r2']:.4f}")
+    k4.metric("p-value", "—" if corr["p_value"] is None else f"{corr['p_value']:.4g}")
+
+    if corr.get("note"):
+        st.caption(str(corr["note"]))
+
+    # gráfico de correlación
+    df_plot = df_corr_base[[x_var, y_var, "treatment"]].dropna()
+    figc = px.scatter(
+        df_plot,
+        x=x_var,
+        y=y_var,
+        color="treatment",
+        trendline="ols" if method == "pearson" else None,
+        template="simple_white",
+        title=f"Correlación ({method}): {x_var} vs {y_var}",
+    )
+    st.plotly_chart(figc, use_container_width=True)
 
 
 # ------------------------ TAB 3: Test de medias ------------------------
