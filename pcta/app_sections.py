@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+from scipy import stats as sps
 
 from pcta.auth import logout_button
 from pcta.core.calculations import compute_all_units
@@ -42,7 +44,7 @@ def init_state() -> None:
             report_bytes=None,
         )
 
-    # Variable elegida por el usuario (puede ser raw o KPI)
+    # Variable elegida por el usuario (raw)
     st.session_state.setdefault("analysis_variable", None)
     st.session_state.setdefault("analysis_variable_label", None)
     st.session_state.setdefault("analysis_source", None)  # "raw" | "kpi"
@@ -97,36 +99,103 @@ def fmt_num(x: object, decimals: int = 2) -> str:
 
 
 def describe_by_group(df: pd.DataFrame, group_col: str, metric: str) -> pd.DataFrame:
+    """
+    Descriptiva por grupo mejorada:
+    - n, media, sd, cv_pct, min, p10, p25, mediana, p75, p90, max, rango
+    """
     if metric not in df.columns or group_col not in df.columns:
         return pd.DataFrame()
 
+    sub = df[[group_col, metric]].dropna()
+    if sub.empty:
+        return pd.DataFrame()
+
     g = (
-        df.groupby(group_col)[metric]
-        .agg(["count", "mean", "std", "min", "median", "max"])
-        .rename(columns={"count": "n", "mean": "media", "std": "sd", "median": "mediana"})
+        sub.groupby(group_col)[metric]
+        .agg(
+            n="count",
+            media="mean",
+            sd=lambda s: float(s.std(ddof=1)),
+            min="min",
+            p10=lambda s: float(s.quantile(0.10)),
+            p25=lambda s: float(s.quantile(0.25)),
+            mediana="median",
+            p75=lambda s: float(s.quantile(0.75)),
+            p90=lambda s: float(s.quantile(0.90)),
+            max="max",
+        )
         .reset_index()
     )
-    pcts = (
-        df.groupby(group_col)[metric]
-        .quantile([0.25, 0.75])
-        .unstack(level=1)
-        .reset_index()
-        .rename(columns={0.25: "p25", 0.75: "p75"})
-    )
-    out = g.merge(pcts, on=group_col, how="left").sort_values(group_col).reset_index(drop=True)
-    return out
+
+    g["rango"] = g["max"] - g["min"]
+    g["cv_pct"] = g.apply(lambda r: (np.nan if r["media"] == 0 else 100.0 * r["sd"] / abs(r["media"])), axis=1)
+    g = g.sort_values(group_col).reset_index(drop=True)
+    return g
 
 
-def styled_desc(desc: pd.DataFrame, decimals: int = 2) -> pd.DataFrame:
+def _format_desc_table(desc: pd.DataFrame, *, group_col: str, decimals: int) -> pd.DataFrame:
     if desc.empty:
         return desc
+
     out = desc.copy()
-    for col in ["media", "sd", "min", "p25", "mediana", "p75", "max"]:
-        if col in out.columns:
-            out[col] = out[col].apply(lambda v: fmt_num(v, decimals=decimals))
     if "n" in out.columns:
         out["n"] = out["n"].fillna(0).astype(int)
-    return out
+
+    num_cols = [c for c in out.columns if c not in {group_col, "n"}]
+    for c in num_cols:
+        if c == "cv_pct":
+            out[c] = out[c].apply(lambda v: "" if pd.isna(v) else f"{float(v):.{min(2,decimals)}f}%")
+        else:
+            out[c] = out[c].apply(lambda v: "" if pd.isna(v) else f"{float(v):,.{decimals}f}")
+
+    rename = {
+        group_col: "Tratamiento",
+        "n": "n",
+        "media": "Media",
+        "sd": "SD",
+        "cv_pct": "CV%",
+        "min": "Mín",
+        "p10": "P10",
+        "p25": "P25",
+        "mediana": "Mediana",
+        "p75": "P75",
+        "p90": "P90",
+        "max": "Máx",
+        "rango": "Rango",
+    }
+    return out.rename(columns=rename)
+
+
+def _homogeneity_tests(df: pd.DataFrame, group_col: str, metric: str) -> Dict[str, object]:
+    sub = df[[group_col, metric]].dropna()
+    if sub.empty:
+        return {"levene_p": None, "shapiro_min_p": None, "notes": "Sin datos."}
+
+    groups = []
+    shapiro_pvals: List[float] = []
+
+    for _, g in sub.groupby(group_col):
+        arr = g[metric].to_numpy(dtype=float)
+        groups.append(arr)
+        if arr.size >= 3:
+            try:
+                shapiro_pvals.append(float(sps.shapiro(arr).pvalue))
+            except Exception:
+                pass
+
+    levene_p = None
+    try:
+        if len(groups) >= 2 and all(len(x) >= 2 for x in groups):
+            levene_p = float(sps.levene(*groups, center="median").pvalue)
+    except Exception:
+        levene_p = None
+
+    shapiro_min_p = float(min(shapiro_pvals)) if shapiro_pvals else None
+
+    notes = []
+    notes.append("Levene (mediana) evalúa homogeneidad de varianzas (p>0.05 sugiere varianzas similares).")
+    notes.append("Shapiro (p>0.05) sugiere normalidad; se reporta el p mínimo entre tratamientos (si n>=3).")
+    return {"levene_p": levene_p, "shapiro_min_p": shapiro_min_p, "notes": " ".join(notes)}
 
 
 def numeric_kpi_columns(unit_kpis_df: pd.DataFrame) -> List[str]:
@@ -214,14 +283,6 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
 
 
 def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bool) -> None:
-    """
-    Corre el pipeline completo:
-    - to_units
-    - validate
-    - compute_all_units
-    - run_inferential_statistics (default metrics)
-    - export_report_xlsx
-    """
     state = get_state()
     if state.parsed is None:
         st.error("Primero carga el archivo principal.")
@@ -360,7 +421,7 @@ def tab_1_select_variable_and_run() -> None:
         st.success("Listo. Ve a la pestaña 2 para ver resultados.")
 
 
-# ------------------------ TAB 2: Resultados de variable (descriptiva + gráficos) ------------------------
+# ------------------------ TAB 2: Resultados (MEJORADO) ------------------------
 
 
 def tab_2_results_for_selected_variable() -> None:
@@ -388,7 +449,10 @@ def tab_2_results_for_selected_variable() -> None:
         return
 
     n_units = int(len(hs))
-    n_trt = int(hs["treatment"].astype(str).nunique())
+    treatments = sorted(hs["treatment"].astype(str).unique().tolist())
+    n_trt = int(len(treatments))
+    missing = int(hs[var].isna().sum())
+    valid = int(hs[var].notna().sum())
 
     st.markdown(
         f"""
@@ -396,16 +460,45 @@ def tab_2_results_for_selected_variable() -> None:
           <div><div class="label">Variable</div><div class="value">{label}</div></div>
           <div><div class="label">Unidades</div><div class="value">{n_units}</div></div>
           <div><div class="label">Tratamientos</div><div class="value">{n_trt}</div></div>
+          <div><div class="label">Valores válidos</div><div class="value">{valid}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.divider()
-    st.markdown("### Resumen descriptivo por tratamiento")
-    decimals = st.slider("Decimales", 0, 6, 2, key="desc_decimals")
+    st.markdown("### Tabla de datos (variable seleccionada)")
+    cols_show = [c for c in ["trial_id", "unit_id", "unit_type", "treatment"] if c in hs.columns] + [var]
+    data_view = hs[cols_show].copy()
+
+    show_data = st.toggle("Mostrar tabla de datos", value=True, key="tab2_show_data_table")
+    if show_data:
+        st.dataframe(data_view, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Resumen descriptivo por tratamiento (mejorado)")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        decimals = st.slider("Decimales", 0, 6, 2, key="tab2_desc_decimals")
+    with c2:
+        st.caption("Incluye: Media, SD, CV%, percentiles (P10/P25/P75/P90), rango.")
+
     desc = describe_by_group(hs, "treatment", var)
-    st.dataframe(styled_desc(desc, decimals=decimals), use_container_width=True, hide_index=True)
+    desc_fmt = _format_desc_table(desc, group_col="treatment", decimals=decimals)
+    st.dataframe(desc_fmt, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Supuestos (informativo)")
+    tests = _homogeneity_tests(hs, "treatment", var)
+
+    cA, cB, cC = st.columns(3)
+    with cA:
+        st.metric("Levene p (varianzas)", value=("—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}"))
+    with cB:
+        st.metric("Shapiro min p", value=("—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}"))
+    with cC:
+        st.metric("NA (faltantes)", value=str(missing))
+    st.caption(str(tests["notes"]))
 
     st.divider()
     st.markdown("### Gráficos")
@@ -416,30 +509,32 @@ def tab_2_results_for_selected_variable() -> None:
         st.error("No está instalado Plotly.")
         return
 
-    c1, c2 = st.columns(2)
-    with c1:
-        fig1 = px.box(
-            hs,
-            x="treatment",
-            y=var,
-            points="all",
-            template="simple_white",
-            title=f"{label} (distribución)",
-        )
+    chart_type = st.radio(
+        "Tipo de gráfico",
+        options=["Box (con puntos)", "Violín", "Barras (media)"],
+        horizontal=True,
+        key="tab2_chart_type",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if chart_type == "Box (con puntos)":
+            fig1 = px.box(hs, x="treatment", y=var, points="all", template="simple_white", title=f"{label} — distribución")
+        elif chart_type == "Violín":
+            fig1 = px.violin(hs, x="treatment", y=var, box=True, points="all", template="simple_white", title=f"{label} — distribución")
+        else:
+            means = hs.groupby("treatment", as_index=False)[var].mean(numeric_only=True)
+            fig1 = px.bar(means, x="treatment", y=var, template="simple_white", title=f"{label} — media")
         st.plotly_chart(fig1, use_container_width=True)
-    with c2:
-        means = hs.groupby("treatment", as_index=False)[var].mean(numeric_only=True)
-        fig2 = px.bar(
-            means,
-            x="treatment",
-            y=var,
-            template="simple_white",
-            title=f"{label} (media)",
-        )
+
+    with col2:
+        agg = hs.groupby("treatment", as_index=False)[var].agg(["mean", "std", "count"]).reset_index()
+        agg = agg.rename(columns={"mean": "media", "std": "sd", "count": "n"})
+        fig2 = px.bar(agg, x="treatment", y="media", error_y="sd", template="simple_white", title=f"{label} — media ± SD")
         st.plotly_chart(fig2, use_container_width=True)
 
 
-# ------------------------ TAB 3: Test de medias sobre la variable seleccionada ------------------------
+# ------------------------ TAB 3: Test de medias ------------------------
 
 
 def tab_3_mean_tests() -> None:
@@ -479,7 +574,7 @@ def tab_3_mean_tests() -> None:
 
     st.divider()
     st.markdown("### Método")
-    test_mode = st.selectbox(
+    _ = st.selectbox(
         "Test de medias",
         options=[
             "AUTO (según supuestos)",
