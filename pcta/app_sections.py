@@ -484,7 +484,6 @@ def tab_2_results_for_selected_variable() -> None:
         st.error(f"La variable seleccionada ({var}) no existe en HOUSE_SUMMARY.")
         return
 
-    # Cards (más tipo dashboard)
     n_units = int(len(hs))
     treatments = sorted(hs["treatment"].astype(str).unique().tolist())
     n_trt = int(len(treatments))
@@ -497,7 +496,6 @@ def tab_2_results_for_selected_variable() -> None:
     c3.metric("Tratamientos", str(n_trt))
     c4.metric("Válidos", str(valid))
 
-    # Tabla de datos (auditoría)
     st.divider()
     st.markdown("### Datos de la variable seleccionada")
 
@@ -510,7 +508,6 @@ def tab_2_results_for_selected_variable() -> None:
     with st.expander("Ver tabla de datos", expanded=True):
         st.dataframe(data_view, use_container_width=True, hide_index=True)
 
-    # Resumen descriptivo
     st.divider()
     st.markdown("### Resumen descriptivo por tratamiento (mejorado)")
 
@@ -524,7 +521,6 @@ def tab_2_results_for_selected_variable() -> None:
     desc_fmt = _format_desc_table(desc, group_col="treatment", decimals=decimals)
     st.dataframe(desc_fmt, use_container_width=True, hide_index=True)
 
-    # Supuestos (informativo)
     st.divider()
     st.markdown("### Supuestos (informativo)")
     tests = _homogeneity_tests(hs, "treatment", var)
@@ -534,7 +530,6 @@ def tab_2_results_for_selected_variable() -> None:
     c.metric("NA (faltantes)", str(missing))
     st.caption(str(tests["notes"]))
 
-    # Gráficos
     st.divider()
     st.markdown("### Gráficos")
 
@@ -570,7 +565,6 @@ def tab_2_results_for_selected_variable() -> None:
         fig2 = px.bar(agg, x="treatment", y="media", error_y="sd", template="simple_white", title=f"{label} — media ± SD")
         st.plotly_chart(fig2, use_container_width=True)
 
-    # Correlación 2x2 (población completa o filtrada por tratamientos)
     st.divider()
     st.markdown("### Correlación entre variables (2×2)")
 
@@ -624,17 +618,29 @@ def tab_2_results_for_selected_variable() -> None:
     if corr.get("note"):
         st.caption(str(corr["note"]))
 
-    # gráfico de correlación
     df_plot = df_corr_base[[x_var, y_var, "treatment"]].dropna()
-    figc = px.scatter(
-        df_plot,
-        x=x_var,
-        y=y_var,
-        color="treatment",
-        trendline="ols" if method == "pearson" else None,
-        template="simple_white",
-        title=f"Correlación ({method}): {x_var} vs {y_var}",
-    )
+
+    # IMPORTANTE: si es población total, NO separar por treatment
+    if scope == "Toda la población":
+        figc = px.scatter(
+            df_plot,
+            x=x_var,
+            y=y_var,
+            trendline="ols" if method == "pearson" else None,
+            template="simple_white",
+            title=f"Correlación ({method}) — población total: {x_var} vs {y_var}",
+        )
+    else:
+        figc = px.scatter(
+            df_plot,
+            x=x_var,
+            y=y_var,
+            color="treatment",
+            trendline="ols" if method == "pearson" else None,
+            template="simple_white",
+            title=f"Correlación ({method}) — por tratamiento: {x_var} vs {y_var}",
+        )
+
     st.plotly_chart(figc, use_container_width=True)
 
 
