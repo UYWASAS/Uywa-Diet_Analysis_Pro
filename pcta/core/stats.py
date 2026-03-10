@@ -1,8 +1,12 @@
-"""
+ """
 Inferential statistics for PCTA (with safety rule).
 
+UPDATED (flexible grouping):
+- The code no longer assumes the grouping column is named 'treatment' everywhere.
+- New/extended APIs allow passing `group_col` (or `treatment_col`) explicitly.
+
 Safety rule (critical):
-- If replication per treatment < 2, DO NOT output p-values.
+- If replication per group < 2, DO NOT output p-values.
   => This module returns disabled results with a reason and warnings.
 
 When replication exists (per metric after NA drop):
@@ -22,7 +26,7 @@ Effect sizes:
 - Kruskal: epsilon^2
 
 Implementation notes:
-- Works on a DataFrame of unit KPIs (one row per unit).
+- Works on a DataFrame of unit KPIs (one row per unit) or any DataFrame passed by caller.
 - Missing values for a metric are dropped only for that metric.
 """
 
@@ -46,8 +50,8 @@ class StatsOptions:
     enable_posthoc: bool = True
 
 
-def _rep_by_treatment(sub: pd.DataFrame, treatment_col: str) -> Dict[str, int]:
-    return sub.groupby(treatment_col).size().astype(int).to_dict()
+def _rep_by_group(sub: pd.DataFrame, group_col: str) -> Dict[str, int]:
+    return sub.groupby(group_col).size().astype(int).to_dict()
 
 
 def _min_n(rep: Dict[str, int]) -> int:
@@ -158,7 +162,7 @@ def analyze_metric(
     df: pd.DataFrame,
     *,
     metric: str,
-    treatment_col: str = "treatment",
+    group_col: str = "treatment",
     alpha: float,
     enable_posthoc: bool,
 ) -> Tuple[Dict[str, Any], List[AnalysisWarning]]:
@@ -168,10 +172,11 @@ def analyze_metric(
     """
     warnings: List[AnalysisWarning] = []
 
-    if treatment_col not in df.columns or metric not in df.columns:
+    if group_col not in df.columns or metric not in df.columns:
         return (
             {
                 "metric": metric,
+                "group_col": group_col,
                 "test": None,
                 "p_value": None,
                 "effect_size": None,
@@ -184,11 +189,12 @@ def analyze_metric(
             warnings,
         )
 
-    sub = df[[treatment_col, metric]].dropna()
+    sub = df[[group_col, metric]].dropna()
     if sub.empty:
         return (
             {
                 "metric": metric,
+                "group_col": group_col,
                 "test": None,
                 "p_value": None,
                 "effect_size": None,
@@ -201,20 +207,21 @@ def analyze_metric(
             warnings,
         )
 
-    rep = _rep_by_treatment(sub, treatment_col)
+    rep = _rep_by_group(sub, group_col)
     min_n = _min_n(rep)
     if min_n < 2:
-        msg = "Inferencia deshabilitada por falta de replicación (n<2 por tratamiento)."
+        msg = "Inferencia deshabilitada por falta de replicación (n<2 por grupo)."
         warnings.append(
             AnalysisWarning(
                 code=WarningCode.inferential_disabled_no_replication,
                 message=msg,
-                context={"metric": metric, "replication_by_treatment": rep, "min_n_per_treatment": min_n},
+                context={"metric": metric, "group_col": group_col, "replication_by_group": rep, "min_n_per_group": min_n},
             )
         )
         return (
             {
                 "metric": metric,
+                "group_col": group_col,
                 "test": None,
                 "p_value": None,
                 "effect_size": None,
@@ -227,8 +234,8 @@ def analyze_metric(
             warnings,
         )
 
-    treatments = list(rep.keys())
-    groups = [sub.loc[sub[treatment_col] == t, metric].to_numpy(dtype=float) for t in treatments]
+    groups_labels = list(rep.keys())
+    groups = [sub.loc[sub[group_col] == g, metric].to_numpy(dtype=float) for g in groups_labels]
     y = sub[metric].to_numpy(dtype=float)
 
     shapiro_min_p, normal, shapiro_note = _shapiro_min_p(groups, alpha)
@@ -237,6 +244,7 @@ def analyze_metric(
 
     result: Dict[str, Any] = {
         "metric": metric,
+        "group_col": group_col,
         "test": None,
         "p_value": None,
         "effect_size": None,
@@ -263,7 +271,7 @@ def analyze_metric(
             try:
                 tuk = pairwise_tukeyhsd(
                     endog=sub[metric].to_numpy(float),
-                    groups=sub[treatment_col].to_numpy(str),
+                    groups=sub[group_col].to_numpy(str),
                     alpha=alpha,
                 )
                 header, *rows = tuk._results_table.data  # type: ignore[attr-defined]
@@ -299,7 +307,7 @@ def analyze_metric(
 
             welch = anova_oneway(
                 sub[metric].to_numpy(float),
-                sub[treatment_col].to_numpy(str),
+                sub[group_col].to_numpy(str),
                 use_var="unequal",
                 welch_correction=True,
             )
@@ -315,9 +323,9 @@ def analyze_metric(
         if enable_posthoc:
             pairs: List[Tuple[str, str]] = []
             p_raw: List[float] = []
-            for a, b in combinations(treatments, 2):
-                ga = sub.loc[sub[treatment_col] == a, metric].to_numpy(float)
-                gb = sub.loc[sub[treatment_col] == b, metric].to_numpy(float)
+            for a, b in combinations(groups_labels, 2):
+                ga = sub.loc[sub[group_col] == a, metric].to_numpy(float)
+                gb = sub.loc[sub[group_col] == b, metric].to_numpy(float)
                 t = sps.ttest_ind(ga, gb, equal_var=False, nan_policy="omit")
                 pairs.append((a, b))
                 p_raw.append(float(t.pvalue))
@@ -337,11 +345,11 @@ def analyze_metric(
         return result, warnings
 
     if enable_posthoc:
-        pairs: List[Tuple[str, str]] = []
-        p_raw: List[float] = []
-        for a, b in combinations(treatments, 2):
-            ga = sub.loc[sub[treatment_col] == a, metric].to_numpy(float)
-            gb = sub.loc[sub[treatment_col] == b, metric].to_numpy(float)
+        pairs = []
+        p_raw = []
+        for a, b in combinations(groups_labels, 2):
+            ga = sub.loc[sub[group_col] == a, metric].to_numpy(float)
+            gb = sub.loc[sub[group_col] == b, metric].to_numpy(float)
             u = sps.mannwhitneyu(ga, gb, alternative="two-sided")
             pairs.append((a, b))
             p_raw.append(float(u.pvalue))
@@ -351,45 +359,48 @@ def analyze_metric(
     return result, warnings
 
 
-def run_inferential_statistics(
-    unit_kpis: List[Any],
-    *,
-    metrics: List[str],
-    options: StatsOptions,
-) -> Tuple[pd.DataFrame, Dict[str, int], int, bool, List[AnalysisWarning]]:
-    """
-    Run inferential statistics for the given list of metrics.
-
-    Returns:
-        stats_df, replication_by_treatment (unit counts), min_n_per_treatment, inferential_enabled_overall, warnings
-    """
-    # Supports pydantic models (model_dump) or dicts
-    rows = []
+def _to_df(unit_kpis: List[Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
     for x in unit_kpis:
         if hasattr(x, "model_dump"):
             rows.append(x.model_dump())
         elif isinstance(x, dict):
             rows.append(x)
         else:
-            # best-effort
             rows.append(dict(x))  # type: ignore[arg-type]
+    return pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows)
 
-    if "treatment" not in df.columns:
+def run_inferential_statistics(
+    unit_kpis: List[Any],
+    *,
+    metrics: List[str],
+    options: StatsOptions,
+    group_col: str = "treatment",
+) -> Tuple[pd.DataFrame, Dict[str, int], int, bool, List[AnalysisWarning]]:
+    """
+    Backwards-compatible: default group_col='treatment'.
+    Now supports passing group_col explicitly for flexible grouping.
+
+    Returns:
+        stats_df, replication_by_group, min_n_per_group, inferential_enabled_overall, warnings
+    """
+    df = _to_df(unit_kpis)
+
+    if group_col not in df.columns:
         rep_all: Dict[str, int] = {}
         min_n_all = 0
         enabled_overall = False
         warnings = [
             AnalysisWarning(
                 code=WarningCode.validation_adjustment,
-                message="No existe columna 'treatment' en unit_kpis; inferencia deshabilitada.",
-                context={},
+                message=f"No existe columna '{group_col}' en unit_kpis; inferencia deshabilitada.",
+                context={"group_col": group_col},
             )
         ]
         return pd.DataFrame([]), rep_all, min_n_all, enabled_overall, warnings
 
-    rep_all = df.groupby("treatment").size().astype(int).to_dict()
+    rep_all = df.groupby(group_col).size().astype(int).to_dict()
     min_n_all = int(min(rep_all.values())) if rep_all else 0
     enabled_overall = min_n_all >= 2
 
@@ -398,8 +409,8 @@ def run_inferential_statistics(
         warnings.append(
             AnalysisWarning(
                 code=WarningCode.inferential_disabled_no_replication,
-                message="Inferencia deshabilitada por falta de replicación (n<2 por tratamiento).",
-                context={"replication_by_treatment": rep_all, "min_n_per_treatment": min_n_all},
+                message="Inferencia deshabilitada por falta de replicación (n<2 por grupo).",
+                context={"group_col": group_col, "replication_by_group": rep_all, "min_n_per_group": min_n_all},
             )
         )
 
@@ -408,6 +419,7 @@ def run_inferential_statistics(
         res, w = analyze_metric(
             df,
             metric=metric,
+            group_col=group_col,
             alpha=float(options.alpha),
             enable_posthoc=bool(options.enable_posthoc),
         )
@@ -416,3 +428,33 @@ def run_inferential_statistics(
 
     stats_df = pd.DataFrame(out_rows)
     return stats_df, rep_all, min_n_all, enabled_overall, warnings
+
+
+# New helper for raw-DataFrame use (optional, but makes app wiring much easier)
+def run_inferential_statistics_df(
+    df: pd.DataFrame,
+    *,
+    metric: str,
+    group_col: str,
+    options: StatsOptions,
+) -> Tuple[pd.DataFrame, Dict[str, int], int, bool, List[AnalysisWarning]]:
+    """
+    Same logic as run_inferential_statistics, but operates on an arbitrary DataFrame.
+    Useful for the new "flexible Excel" mode (HOUSE_SUMMARY raw).
+
+    Returns:
+        stats_df (single-row), replication_by_group, min_n_per_group, enabled, warnings
+    """
+    res, warnings = analyze_metric(
+        df,
+        metric=metric,
+        group_col=group_col,
+        alpha=float(options.alpha),
+        enable_posthoc=bool(options.enable_posthoc),
+    )
+
+    sub = df[[group_col, metric]].dropna() if (group_col in df.columns and metric in df.columns) else pd.DataFrame()
+    rep = _rep_by_group(sub, group_col) if not sub.empty else {}
+    min_n = _min_n(rep)
+    enabled = min_n >= 2
+    return pd.DataFrame([res]), rep, min_n, enabled, warnings
