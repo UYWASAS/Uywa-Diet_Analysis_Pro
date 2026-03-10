@@ -110,12 +110,9 @@ tabs = st.tabs(["1) Selección", "2) Resultados", "3) Test de medias", "4) Expor
 
 with tabs[0]:
     tab_1_select_variable_and_run()
-
 with tabs[1]:
     tab_2_results_for_selected_variable()
-
 with tabs[2]:
     tab_3_mean_tests()
-
 with tabs[3]:
     tab_export()
