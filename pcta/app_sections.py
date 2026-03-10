@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -45,6 +46,11 @@ def init_state() -> None:
             report_bytes=None,
         )
 
+    # NUEVO: modo libre (cualquier Excel/CSV)
+    st.session_state.setdefault("raw_df", None)  # pd.DataFrame | None
+    st.session_state.setdefault("raw_mode", False)  # bool
+    st.session_state.setdefault("raw_sheet_name", None)  # str | None
+
     # Selección explícita (no asumir nombres)
     st.session_state.setdefault("dv_col", None)  # Y
     st.session_state.setdefault("factor_a", None)  # tratamiento-like
@@ -79,7 +85,7 @@ def set_state(**kwargs) -> None:
     )
 
 
-# ------------------------ Helpers (UI + datos) ------------------------
+# ------------------------ Helpers ------------------------
 
 
 def _inject_table_css() -> None:
@@ -140,14 +146,8 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, List[str]]) -> pd.DataFra
 def render_design_controls(
     df: pd.DataFrame, *, prefix_key: str
 ) -> Tuple[str, str, Optional[str], Optional[str], Dict[str, List[str]]]:
-    """
-    Controles de diseño experimental, reutilizables en pestañas 1/2/3.
-
-    Devuelve:
-      dv_col, factor_a, factor_b, block_col, filters
-    """
-    num = numeric_cols(df, exclude={"trial_id"})
-    cat = categorical_cols(df, exclude={"trial_id"})
+    num = numeric_cols(df)
+    cat = categorical_cols(df)
 
     if not num:
         st.error("No hay columnas numéricas disponibles para Y.")
@@ -157,14 +157,13 @@ def render_design_controls(
         st.error("No hay columnas categóricas disponibles para factores/filtros.")
         return "", "", None, None, {}
 
-    dv_default = st.session_state.get("dv_col") or (
-        st.session_state.get("analysis_variable") if st.session_state.get("analysis_variable") in num else num[0]
-    )
+    dv_default = st.session_state.get("dv_col") or (st.session_state.get("analysis_variable") if st.session_state.get("analysis_variable") in num else num[0])
     if dv_default not in num:
         dv_default = num[0]
 
     fa_default = st.session_state.get("factor_a")
     if fa_default not in cat:
+        # No asumimos treatment; si existe, lo preferimos, si no el primero
         fa_default = "treatment" if "treatment" in cat else cat[0]
 
     dv_col = st.selectbox("Variable dependiente (Y)", options=num, index=num.index(dv_default), key=f"{prefix_key}_dv")
@@ -173,9 +172,7 @@ def render_design_controls(
     st.session_state["analysis_variable_label"] = dv_col
     st.session_state["analysis_source"] = "raw"
 
-    factor_a = st.selectbox(
-        "Factor A (principal / tratamiento)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa"
-    )
+    factor_a = st.selectbox("Factor A (principal)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa")
     st.session_state["factor_a"] = factor_a
 
     b_opts = [None] + [c for c in cat if c != factor_a]
@@ -342,6 +339,60 @@ def correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, obje
     return {"n": n, "r": r, "r2": float(r * r), "p_value": p}
 
 
+def _read_any_file_to_df(file_name: str, file_bytes: bytes) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Best-effort reader for "free mode".
+    - CSV -> a single DF
+    - XLSX -> picks first sheet by default (sheet selection handled outside)
+    Returns (df, error_message)
+    """
+    lower = file_name.lower()
+    try:
+        if lower.endswith(".csv"):
+            return pd.read_csv(BytesIO(file_bytes)), None
+        if lower.endswith(".xlsx"):
+            # caller will typically read specific sheet; default to first sheet
+            xls = pd.ExcelFile(BytesIO(file_bytes))
+            first = xls.sheet_names[0] if xls.sheet_names else None
+            if first is None:
+                return pd.DataFrame(), "El archivo Excel no tiene hojas."
+            return pd.read_excel(BytesIO(file_bytes), sheet_name=first), None
+        return pd.DataFrame(), "Formato no soportado (solo .csv o .xlsx)."
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+def _excel_sheets(file_bytes: bytes) -> List[str]:
+    try:
+        xls = pd.ExcelFile(BytesIO(file_bytes))
+        return list(xls.sheet_names)
+    except Exception:
+        return []
+
+
+def _read_excel_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
+
+
+def get_active_df() -> Optional[pd.DataFrame]:
+    """
+    Returns the DataFrame to use for flexible analysis:
+    - if raw_mode: st.session_state["raw_df"]
+    - else: parsed house_summary
+    """
+    if st.session_state.get("raw_mode") and isinstance(st.session_state.get("raw_df"), pd.DataFrame):
+        return st.session_state["raw_df"]
+
+    state = get_state()
+    if state.parsed is None:
+        return None
+
+    dfs = state.parsed.to_dataframes()
+    if "house_summary" in dfs:
+        return dfs["house_summary"].copy()
+    return None
+
+
 # ------------------------ Sidebar minimal ------------------------
 
 
@@ -370,8 +421,8 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
         )
 
         logout_button()
-
         st.divider()
+
         st.subheader("Carga de archivos")
         uploaded_main = st.file_uploader(
             "Ensayo (Excel .xlsx o CSV .csv)",
@@ -383,15 +434,23 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
     return SidebarResult(uploaded_main=uploaded_main)
 
 
-# ------------------------ Parse ------------------------
+# ------------------------ Parse / Load ------------------------
 
 
 def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
+    """
+    Tries to parse using the existing strict PCTA parser.
+    If it fails, falls back to "free mode" loading into raw_df.
+    """
     if uploaded_main is None:
         return
 
+    file_name = uploaded_main.name
+    file_bytes = uploaded_main.getvalue()
+
+    # Try strict parse first (legacy)
     try:
-        parsed = parse_uploaded_file(uploaded_main.name, uploaded_main.getvalue())
+        parsed = parse_uploaded_file(file_name, file_bytes)
         set_state(
             parsed=parsed,
             units=None,
@@ -401,26 +460,66 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
             warnings=[],
             report_bytes=None,
         )
+        st.session_state["raw_mode"] = False
+        st.session_state["raw_df"] = None
+        st.session_state["raw_sheet_name"] = None
+        return
     except Exception as e:
-        st.error(f"No se pudo leer el archivo principal: {e}")
-        set_state(
-            parsed=None,
-            units=None,
-            unit_kpis_df=None,
-            treatment_summary_df=None,
-            stats_df=None,
-            warnings=[],
-            report_bytes=None,
-        )
+        # fallback to free mode
+        st.warning(f"Modo PCTA estándar no aplica. Activando Modo Libre. Detalle: {e}")
+
+    # Free mode: load
+    lower = file_name.lower()
+    if lower.endswith(".xlsx"):
+        sheets = _excel_sheets(file_bytes)
+        if not sheets:
+            st.error("No pude leer hojas del Excel.")
+            return
+
+        # Keep sheet selection in session
+        default_sheet = st.session_state.get("raw_sheet_name") or sheets[0]
+        if default_sheet not in sheets:
+            default_sheet = sheets[0]
+
+        # Render selector immediately in sidebar area
+        with st.sidebar:
+            st.subheader("Modo Libre — hoja a usar")
+            sheet = st.selectbox("Hoja", options=sheets, index=sheets.index(default_sheet), key="raw_sheet_select")
+        st.session_state["raw_sheet_name"] = sheet
+
+        try:
+            df = _read_excel_sheet(file_bytes, sheet_name=sheet)
+        except Exception as e:
+            st.error(f"No pude leer la hoja '{sheet}': {e}")
+            return
+
+        st.session_state["raw_mode"] = True
+        st.session_state["raw_df"] = df
+        set_state(parsed=None, units=None, unit_kpis_df=None, treatment_summary_df=None, stats_df=None, warnings=[], report_bytes=None)
+        return
+
+    # CSV
+    df, err = _read_any_file_to_df(file_name, file_bytes)
+    if err:
+        st.error(f"No se pudo cargar el archivo en modo libre: {err}")
+        return
+
+    st.session_state["raw_mode"] = True
+    st.session_state["raw_df"] = df
+    st.session_state["raw_sheet_name"] = None
+    set_state(parsed=None, units=None, unit_kpis_df=None, treatment_summary_df=None, stats_df=None, warnings=[], report_bytes=None)
 
 
-# ------------------------ Pipeline (KPIs / export legado) ------------------------
+# ------------------------ KPI pipeline (solo modo PCTA estándar) ------------------------
 
 
 def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bool) -> None:
+    """
+    Corre el pipeline KPI legado SOLO si estamos en modo PCTA estándar (parsed != None).
+    """
     state = get_state()
     if state.parsed is None:
-        st.error("Primero carga el archivo principal.")
+        st.error("El análisis KPI requiere modo PCTA estándar (archivo con estructura esperada).")
         return
 
     try:
@@ -436,11 +535,10 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
             computed,
             metrics=metrics_default,
             options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
-            group_col="treatment",  # export legado
+            group_col="treatment",
         )
 
         all_warnings = [*v_warnings, *c_warnings, *s_warnings]
-
         report_bytes = export_report_xlsx(
             ExportPayload(
                 cleaned_input=state.parsed.cleaned_input,
@@ -464,56 +562,55 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
         set_state(units=None, unit_kpis_df=None, treatment_summary_df=None, stats_df=None, warnings=[], report_bytes=None)
 
 
-# ------------------------ TAB 1 ------------------------
+# ------------------------ Tabs ------------------------
 
 
 def tab_1_select_variable_and_run() -> None:
-    st.subheader("1) Definir diseño (Y/A/B/bloque/filtros) + correr análisis")
+    st.subheader("1) Definir diseño (Y/A/B/bloque/filtros)")
 
-    state = get_state()
-    if state.parsed is None:
+    df = get_active_df()
+    if df is None:
         st.info("Carga un archivo en la barra lateral para comenzar.")
         return
 
-    hs = state.parsed.to_dataframes()["house_summary"].copy()
+    if st.session_state.get("raw_mode"):
+        st.caption("Modo Libre activado: no se requieren nombres estándar de columnas/hojas.")
 
-    st.markdown("### Diseño del análisis (sin supuestos de nombres)")
-    render_design_controls(hs, prefix_key="tab1_design")
+    st.markdown("### Diseño del análisis")
+    render_design_controls(df, prefix_key="tab1_design")
 
-    st.divider()
-    st.markdown("### Correr análisis (KPIs / export)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True, key="run_wg_negative_is_error")
-    with c2:
-        alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="run_alpha")
-    with c3:
-        enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True, key="run_enable_posthoc")
+    # Solo si estamos en modo estándar (parsed) mostramos botón KPI/export
+    state = get_state()
+    if state.parsed is not None:
+        st.divider()
+        st.markdown("### (Opcional) Correr análisis KPI/Export (modo estándar)")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True, key="run_wg_negative_is_error")
+        with c2:
+            alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="run_alpha")
+        with c3:
+            enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True, key="run_enable_posthoc")
 
-    if st.button("Correr análisis ahora", type="primary", use_container_width=True, key="run_analysis_btn"):
-        run_analysis(alpha=float(alpha), enable_posthoc=bool(enable_posthoc), wg_negative_is_error=bool(wg_negative_is_error))
-        st.success("Listo. Ve a la pestaña 2 (descriptivo) y 3 (inferencial).")
-
-
-# ------------------------ TAB 2 ------------------------
+        if st.button("Correr análisis KPI ahora", type="primary", use_container_width=True, key="run_analysis_btn"):
+            run_analysis(alpha=float(alpha), enable_posthoc=bool(enable_posthoc), wg_negative_is_error=bool(wg_negative_is_error))
+            st.success("Listo. Ve a Exportar para descargar el reporte KPI.")
 
 
 def tab_2_results_for_selected_variable() -> None:
-    st.subheader("2) Resultados (descriptivo + correlación) — flexible")
+    st.subheader("2) Resultados (descriptivo + correlación)")
     _inject_table_css()
 
-    state = get_state()
-    if state.parsed is None:
+    df = get_active_df()
+    if df is None:
         st.info("Carga un archivo primero.")
         return
 
-    hs = state.parsed.to_dataframes()["house_summary"].copy()
-
     st.markdown("### Diseño (puedes ajustar aquí)")
-    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(hs, prefix_key="tab2_design")
+    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2_design")
 
-    hs_f = apply_filters(hs, filters)
-    if hs_f.empty:
+    df_f = apply_filters(df, filters)
+    if df_f.empty:
         st.error("Con los filtros actuales no quedan filas para analizar.")
         return
 
@@ -521,27 +618,26 @@ def tab_2_results_for_selected_variable() -> None:
 
     st.divider()
     st.markdown("### Datos (post-filtro)")
-    cols_show = [c for c in ["trial_id", "unit_id", "unit_type"] if c in hs_f.columns] + group_cols + [dv_col]
+    cols_show = group_cols + [dv_col]
     with st.expander("Ver tabla", expanded=True):
-        st.dataframe(hs_f[cols_show], use_container_width=True, hide_index=True)
+        st.dataframe(df_f[cols_show].dropna(), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Resumen descriptivo")
-    st.caption("Factorial" if factor_b else "1-factor")
     decimals = st.slider("Decimales", 0, 6, 2, key="tab2_decimals")
-    desc = describe_by_group(hs_f, group_cols, dv_col)
+    desc = describe_by_group(df_f, group_cols, dv_col)
     st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Supuestos (informativo; sobre Factor A)")
-    tests = homogeneity_tests(hs_f, factor_a, dv_col)
+    tests = homogeneity_tests(df_f, factor_a, dv_col)
     c1, c2 = st.columns(2)
     c1.metric("Levene p", "—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}")
     c2.metric("Shapiro min p", "—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}")
 
     st.divider()
     st.markdown("### Correlación 2×2 (post-filtro)")
-    num = numeric_cols(hs_f, exclude={"trial_id", "unit_id", "unit_type"})
+    num = numeric_cols(df_f)
     if len(num) < 2:
         st.info("No hay suficientes variables numéricas para correlación.")
         return
@@ -561,7 +657,7 @@ def tab_2_results_for_selected_variable() -> None:
         st.warning("Selecciona X ≠ Y.")
         return
 
-    corr = correlation_stats(hs_f[x_var], hs_f[y_var], method=method)
+    corr = correlation_stats(df_f[x_var], df_f[y_var], method=method)
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("n", str(corr["n"]))
     k2.metric("r", "—" if corr["r"] is None else f"{corr['r']:.4f}")
@@ -574,7 +670,7 @@ def tab_2_results_for_selected_variable() -> None:
         st.error("No está instalado Plotly.")
         return
 
-    df_plot = hs_f[[x_var, y_var]].dropna()
+    df_plot = df_f[[x_var, y_var]].dropna()
     figc = px.scatter(
         df_plot,
         x=x_var,
@@ -586,41 +682,34 @@ def tab_2_results_for_selected_variable() -> None:
     st.plotly_chart(figc, use_container_width=True)
 
 
-# ------------------------ TAB 3 ------------------------
-
-
 def tab_3_mean_tests() -> None:
     st.subheader("3) Inferencial (RAW flexible)")
 
-    state = get_state()
-    if state.parsed is None:
+    df = get_active_df()
+    if df is None:
         st.info("Carga un archivo primero.")
         return
 
-    hs = state.parsed.to_dataframes()["house_summary"].copy()
-
     st.markdown("### Diseño (puedes ajustar aquí)")
-    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(hs, prefix_key="tab3_design")
+    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab3_design")
 
-    hs_f = apply_filters(hs, filters)
-    if hs_f.empty:
+    df_f = apply_filters(df, filters)
+    if df_f.empty:
         st.error("Con los filtros actuales no quedan filas para analizar.")
         return
 
     st.divider()
     st.markdown("### Opciones inferenciales")
     alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="tab3_alpha")
-    enable_posthoc = st.checkbox("Posthoc (solo 1-factor)", value=True, key="tab3_enable_posthoc")
 
-    # Factorial
+    # Factorial A×B
     if factor_b:
-        st.markdown("## ANOVA factorial (A×B)")
         include_interaction = st.checkbox("Incluir interacción A:B", value=True, key="tab3_interaction")
         anova_type = st.selectbox("Tipo de ANOVA", options=[2, 3], index=0, key="tab3_anova_type")
         use_block = st.checkbox("Incluir bloque como efecto fijo", value=bool(block_col), key="tab3_use_block")
 
         aov_df, meta, warnings = run_factorial_anova_df(
-            hs_f,
+            df_f,
             y_col=dv_col,
             factor_a=factor_a,
             factor_b=factor_b,
@@ -635,14 +724,12 @@ def tab_3_mean_tests() -> None:
         if warnings:
             st.markdown("### Advertencias")
             st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
-
-        st.info("Posthoc factorial no está incluido aún (si lo necesitas, lo agregamos).")
         return
 
-    # 1-factor (A)
-    st.markdown("## Inferencia 1-factor (Factor A)")
+    # 1-factor
+    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_enable_posthoc")
     stats_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
-        hs_f,
+        df_f,
         metric=dv_col,
         group_col=factor_a,
         options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
@@ -663,14 +750,11 @@ def tab_3_mean_tests() -> None:
         st.warning("Inferencia deshabilitada: se requiere al menos n>=2 por grupo (Factor A) para p-values.")
 
 
-# ------------------------ Export ------------------------
-
-
 def tab_export() -> None:
-    st.subheader("Exportar (reporte KPI legado)")
+    st.subheader("Exportar (solo modo estándar KPI)")
     state = get_state()
     if state.report_bytes is None:
-        st.info("Corre el análisis (pestaña 1) primero para habilitar el reporte.")
+        st.info("En Modo Libre no se genera el reporte KPI. (Si lo necesitas, lo habilitamos luego).")
         return
 
     st.download_button(
