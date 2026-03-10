@@ -1,9 +1,5 @@
- """
+"""
 Inferential statistics for PCTA (with safety rule).
-
-UPDATED (flexible grouping):
-- The code no longer assumes the grouping column is named 'treatment' everywhere.
-- New/extended APIs allow passing `group_col` (or `treatment_col`) explicitly.
 
 Safety rule (critical):
 - If replication per group < 2, DO NOT output p-values.
@@ -26,7 +22,7 @@ Effect sizes:
 - Kruskal: epsilon^2
 
 Implementation notes:
-- Works on a DataFrame of unit KPIs (one row per unit) or any DataFrame passed by caller.
+- Works on a DataFrame of unit KPIs (one row per unit) OR any DataFrame you pass.
 - Missing values for a metric are dropped only for that metric.
 """
 
@@ -168,7 +164,6 @@ def analyze_metric(
 ) -> Tuple[Dict[str, Any], List[AnalysisWarning]]:
     """
     Analyze a single metric; returns (result_dict, warnings).
-    The result_dict is designed to become a row in STATS sheet.
     """
     warnings: List[AnalysisWarning] = []
 
@@ -234,8 +229,8 @@ def analyze_metric(
             warnings,
         )
 
-    groups_labels = list(rep.keys())
-    groups = [sub.loc[sub[group_col] == g, metric].to_numpy(dtype=float) for g in groups_labels]
+    labels = list(rep.keys())
+    groups = [sub.loc[sub[group_col] == t, metric].to_numpy(dtype=float) for t in labels]
     y = sub[metric].to_numpy(dtype=float)
 
     shapiro_min_p, normal, shapiro_note = _shapiro_min_p(groups, alpha)
@@ -255,7 +250,6 @@ def analyze_metric(
         "disabled_reason": None,
     }
 
-    # Choose test
     if normal and homoscedastic:
         # ANOVA
         try:
@@ -297,11 +291,10 @@ def analyze_metric(
                         context={"metric": metric, "error": str(e)},
                     )
                 )
-
         return result, warnings
 
     if normal and not homoscedastic:
-        # Welch ANOVA via statsmodels anova_oneway
+        # Welch ANOVA
         try:
             from statsmodels.stats.oneway import anova_oneway  # type: ignore
 
@@ -323,7 +316,7 @@ def analyze_metric(
         if enable_posthoc:
             pairs: List[Tuple[str, str]] = []
             p_raw: List[float] = []
-            for a, b in combinations(groups_labels, 2):
+            for a, b in combinations(labels, 2):
                 ga = sub.loc[sub[group_col] == a, metric].to_numpy(float)
                 gb = sub.loc[sub[group_col] == b, metric].to_numpy(float)
                 t = sps.ttest_ind(ga, gb, equal_var=False, nan_policy="omit")
@@ -334,7 +327,7 @@ def analyze_metric(
 
         return result, warnings
 
-    # Non-normal -> Kruskal-Wallis
+    # Non-normal -> Kruskal
     try:
         h = sps.kruskal(*groups)
         result["test"] = "kruskal"
@@ -345,9 +338,9 @@ def analyze_metric(
         return result, warnings
 
     if enable_posthoc:
-        pairs = []
-        p_raw = []
-        for a, b in combinations(groups_labels, 2):
+        pairs: List[Tuple[str, str]] = []
+        p_raw: List[float] = []
+        for a, b in combinations(labels, 2):
             ga = sub.loc[sub[group_col] == a, metric].to_numpy(float)
             gb = sub.loc[sub[group_col] == b, metric].to_numpy(float)
             u = sps.mannwhitneyu(ga, gb, alternative="two-sided")
@@ -379,18 +372,13 @@ def run_inferential_statistics(
     group_col: str = "treatment",
 ) -> Tuple[pd.DataFrame, Dict[str, int], int, bool, List[AnalysisWarning]]:
     """
-    Backwards-compatible: default group_col='treatment'.
-    Now supports passing group_col explicitly for flexible grouping.
-
-    Returns:
-        stats_df, replication_by_group, min_n_per_group, inferential_enabled_overall, warnings
+    Backwards compatible:
+    - default group_col='treatment'
+    - supports any group_col when provided.
     """
     df = _to_df(unit_kpis)
 
     if group_col not in df.columns:
-        rep_all: Dict[str, int] = {}
-        min_n_all = 0
-        enabled_overall = False
         warnings = [
             AnalysisWarning(
                 code=WarningCode.validation_adjustment,
@@ -398,7 +386,7 @@ def run_inferential_statistics(
                 context={"group_col": group_col},
             )
         ]
-        return pd.DataFrame([]), rep_all, min_n_all, enabled_overall, warnings
+        return pd.DataFrame([]), {}, 0, False, warnings
 
     rep_all = df.groupby(group_col).size().astype(int).to_dict()
     min_n_all = int(min(rep_all.values())) if rep_all else 0
@@ -426,11 +414,9 @@ def run_inferential_statistics(
         out_rows.append(res)
         warnings.extend(w)
 
-    stats_df = pd.DataFrame(out_rows)
-    return stats_df, rep_all, min_n_all, enabled_overall, warnings
+    return pd.DataFrame(out_rows), rep_all, min_n_all, enabled_overall, warnings
 
 
-# New helper for raw-DataFrame use (optional, but makes app wiring much easier)
 def run_inferential_statistics_df(
     df: pd.DataFrame,
     *,
@@ -439,11 +425,8 @@ def run_inferential_statistics_df(
     options: StatsOptions,
 ) -> Tuple[pd.DataFrame, Dict[str, int], int, bool, List[AnalysisWarning]]:
     """
-    Same logic as run_inferential_statistics, but operates on an arbitrary DataFrame.
-    Useful for the new "flexible Excel" mode (HOUSE_SUMMARY raw).
-
-    Returns:
-        stats_df (single-row), replication_by_group, min_n_per_group, enabled, warnings
+    Same inference logic as run_inferential_statistics but for arbitrary DataFrames (RAW Excel).
+    Returns a single-row stats_df.
     """
     res, warnings = analyze_metric(
         df,
@@ -453,8 +436,12 @@ def run_inferential_statistics_df(
         enable_posthoc=bool(options.enable_posthoc),
     )
 
-    sub = df[[group_col, metric]].dropna() if (group_col in df.columns and metric in df.columns) else pd.DataFrame()
-    rep = _rep_by_group(sub, group_col) if not sub.empty else {}
+    if group_col in df.columns and metric in df.columns:
+        sub = df[[group_col, metric]].dropna()
+        rep = _rep_by_group(sub, group_col) if not sub.empty else {}
+    else:
+        rep = {}
     min_n = _min_n(rep)
     enabled = min_n >= 2
+
     return pd.DataFrame([res]), rep, min_n, enabled, warnings
