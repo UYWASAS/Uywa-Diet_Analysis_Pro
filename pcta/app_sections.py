@@ -35,17 +35,20 @@ def init_state() -> None:
     st.session_state.setdefault("raw_df", None)  # pd.DataFrame | None
     st.session_state.setdefault("raw_sheet_name", None)
 
-    # Selecciones de análisis
+    # Selecciones de análisis (diseño)
     st.session_state.setdefault("dv_col", None)
     st.session_state.setdefault("factor_a", None)
     st.session_state.setdefault("factor_b", None)
     st.session_state.setdefault("block_col", None)
     st.session_state.setdefault("filters", {})
 
-    # Correlación
-    st.session_state.setdefault("corr_x", None)
-    st.session_state.setdefault("corr_y", None)
+    # Correlación (MÓDULO INDEPENDIENTE)
+    st.session_state.setdefault("corr_scope", "post_filter")  # post_filter | full
+    st.session_state.setdefault("corr_x_var", None)
+    st.session_state.setdefault("corr_y_var", None)
     st.session_state.setdefault("corr_method", "pearson")
+    st.session_state.setdefault("corr_keep_x_fixed", True)
+    st.session_state.setdefault("corr_sync_y_with_dv", False)
 
     # Plots
     st.session_state.setdefault("show_violin", True)
@@ -423,126 +426,166 @@ def tab_2_results_for_selected_variable() -> None:
         st.info("Carga un archivo primero.")
         return
 
-    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2")
-    df_f = apply_filters(df, filters)
+    # Diseño (para descriptivo/distribuciones)
+    st.markdown("### A) Diseño (para descriptivo y distribuciones)")
+    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2_design")
+    df_post = apply_filters(df, filters)
 
-    if df_f.empty:
+    if df_post.empty:
         st.error("Con los filtros actuales no quedan filas.")
         return
 
     group_cols = [factor_a] + ([factor_b] if factor_b else [])
 
     # --- Descriptiva ---
-    st.markdown("### Resumen descriptivo")
+    st.divider()
+    st.markdown("### B) Resumen descriptivo")
     decimals = st.slider("Decimales", 0, 6, 2, key="tab2_decimals")
-    desc = describe_by_group(df_f, group_cols, dv_col)
+    desc = describe_by_group(df_post, group_cols, dv_col)
     st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
 
-    # --- Distribuciones / gráficos ---
+    # --- Distribuciones (plots) ---
     st.divider()
-    st.markdown("### Distribuciones (gráficas)")
-
+    st.markdown("### C) Distribuciones (gráficas)")
     try:
         import plotly.express as px
     except Exception:
         st.error("Plotly no está instalado.")
         return
 
-    # Histograma de Y
-    y_series = df_f[dv_col].dropna()
-    if y_series.empty:
-        st.warning("No hay datos válidos para graficar Y.")
-    else:
-        bins = st.slider("Bins (histograma)", 5, 100, 30, key="hist_bins")
-        fig_hist = px.histogram(df_f, x=dv_col, nbins=bins, template="simple_white", title=f"Distribución de Y: {dv_col}")
-        st.plotly_chart(fig_hist, use_container_width=True)
+    bins = st.slider("Bins (histograma)", 5, 100, 30, key="hist_bins")
+    fig_hist = px.histogram(df_post, x=dv_col, nbins=bins, template="simple_white", title=f"Distribución de Y: {dv_col}")
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-    # Box/violin por Factor A (y color por B si existe)
     show_violin = st.checkbox("Ver violin plot", value=True, key="show_violin")
     show_points = st.checkbox("Mostrar puntos (strip)", value=True, key="show_points")
 
     if factor_b:
-        fig_box = px.violin(
-            df_f,
-            x=factor_a,
-            y=dv_col,
-            color=factor_b,
-            box=True,
-            points="all" if show_points else False,
-            template="simple_white",
-            title=f"Distribución de {dv_col} por {factor_a} (color: {factor_b})",
-        ) if show_violin else px.box(
-            df_f,
-            x=factor_a,
-            y=dv_col,
-            color=factor_b,
-            points="all" if show_points else False,
-            template="simple_white",
-            title=f"{dv_col} por {factor_a} (color: {factor_b})",
+        fig_dist = (
+            px.violin(
+                df_post,
+                x=factor_a,
+                y=dv_col,
+                color=factor_b,
+                box=True,
+                points="all" if show_points else False,
+                template="simple_white",
+                title=f"{dv_col} por {factor_a} (color: {factor_b})",
+            )
+            if show_violin
+            else px.box(
+                df_post,
+                x=factor_a,
+                y=dv_col,
+                color=factor_b,
+                points="all" if show_points else False,
+                template="simple_white",
+                title=f"{dv_col} por {factor_a} (color: {factor_b})",
+            )
         )
     else:
-        fig_box = px.violin(
-            df_f,
-            x=factor_a,
-            y=dv_col,
-            box=True,
-            points="all" if show_points else False,
-            template="simple_white",
-            title=f"Distribución de {dv_col} por {factor_a}",
-        ) if show_violin else px.box(
-            df_f,
-            x=factor_a,
-            y=dv_col,
-            points="all" if show_points else False,
-            template="simple_white",
-            title=f"{dv_col} por {factor_a}",
+        fig_dist = (
+            px.violin(
+                df_post,
+                x=factor_a,
+                y=dv_col,
+                box=True,
+                points="all" if show_points else False,
+                template="simple_white",
+                title=f"{dv_col} por {factor_a}",
+            )
+            if show_violin
+            else px.box(
+                df_post,
+                x=factor_a,
+                y=dv_col,
+                points="all" if show_points else False,
+                template="simple_white",
+                title=f"{dv_col} por {factor_a}",
+            )
         )
-
-    st.plotly_chart(fig_box, use_container_width=True)
+    st.plotly_chart(fig_dist, use_container_width=True)
 
     # --- Supuestos ---
     st.divider()
-    st.markdown("### Supuestos (informativo; sobre Factor A)")
-    tests = homogeneity_tests(df_f, factor_a, dv_col)
+    st.markdown("### D) Supuestos (informativo; sobre Factor A)")
+    tests = homogeneity_tests(df_post, factor_a, dv_col)
     c1, c2 = st.columns(2)
     c1.metric("Levene p", "—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}")
     c2.metric("Shapiro min p", "—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}")
 
-    # --- Correlación ---
+    # --- Correlación independiente ---
     st.divider()
-    st.markdown("### Correlación 2×2 (con gráfica)")
-    num = numeric_cols(df_f)
-    if len(num) < 2:
+    st.markdown("### E) Correlación (módulo independiente)")
+
+    # Scope selector
+    corr_scope = st.radio(
+        "Dataset base para correlación",
+        options=["post_filter", "full"],
+        index=0 if st.session_state.get("corr_scope") == "post_filter" else 1,
+        format_func=lambda v: "Usar datos post-filtro" if v == "post_filter" else "Usar datos completos (sin filtros)",
+        key="corr_scope",
+        horizontal=True,
+    )
+    st.session_state["corr_scope"] = corr_scope
+
+    corr_df = df_post if corr_scope == "post_filter" else df
+
+    # candidates
+    corr_num = numeric_cols(corr_df)
+    if len(corr_num) < 2:
         st.info("No hay suficientes variables numéricas para correlación.")
         return
 
-    x_default = st.session_state.get("corr_x") or num[0]
-    y_default = st.session_state.get("corr_y") or (num[1] if len(num) > 1 else num[0])
-    if x_default not in num:
-        x_default = num[0]
-    if y_default not in num:
-        y_default = num[1] if len(num) > 1 else num[0]
+    # Optional sync: if enabled, set corr_y_var = dv_col (but do not force if invalid)
+    sync_y = st.checkbox("Sincronizar Y de correlación con Y del diseño", value=st.session_state.get("corr_sync_y_with_dv", False), key="corr_sync_y_with_dv")
+    st.session_state["corr_sync_y_with_dv"] = sync_y
+    if sync_y and dv_col in corr_num:
+        st.session_state["corr_y_var"] = dv_col
+
+    # Defaults
+    x_default = st.session_state.get("corr_x_var") or corr_num[0]
+    y_default = st.session_state.get("corr_y_var") or (corr_num[1] if len(corr_num) > 1 else corr_num[0])
+    if x_default not in corr_num:
+        x_default = corr_num[0]
+    if y_default not in corr_num:
+        y_default = corr_num[1] if len(corr_num) > 1 else corr_num[0]
+
+    keep_x_fixed = st.checkbox("Mantener X fijo (solo cambiar Y)", value=st.session_state.get("corr_keep_x_fixed", True), key="corr_keep_x_fixed")
+    st.session_state["corr_keep_x_fixed"] = keep_x_fixed
 
     cL, cM, cR = st.columns([1, 1, 1])
     with cL:
-        x_var = st.selectbox("Variable X", options=num, index=num.index(x_default), key="corr_x")
+        x_var = st.selectbox(
+            "Variable X (correlación)",
+            options=corr_num,
+            index=corr_num.index(x_default),
+            key="corr_x_var",
+            disabled=False if not keep_x_fixed else False,  # X siempre editable; el "fijo" afecta defaults/flujo
+        )
     with cM:
-        y_var = st.selectbox("Variable Y", options=num, index=num.index(y_default), key="corr_y")
+        y_var = st.selectbox(
+            "Variable Y (correlación)",
+            options=corr_num,
+            index=corr_num.index(y_default),
+            key="corr_y_var",
+        )
     with cR:
         method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
 
+    # If keep_x_fixed, keep x when user changes Y (Streamlit state already does that).
     if x_var == y_var:
         st.warning("Selecciona X ≠ Y.")
         return
 
-    corr = correlation_stats(df_f[x_var], df_f[y_var], method=method)
+    corr = correlation_stats(corr_df[x_var], corr_df[y_var], method=method)
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("n", str(corr["n"]))
     k2.metric("r", "—" if corr["r"] is None else f"{corr['r']:.4f}")
     k3.metric("r²", "—" if corr["r2"] is None else f"{corr['r2']:.4f}")
     k4.metric("p-value", "—" if corr["p_value"] is None else f"{corr['p_value']:.4g}")
 
-    df_plot = df_f[[x_var, y_var] + ([factor_a] if factor_a in df_f.columns else [])].dropna()
+    df_plot = corr_df[[x_var, y_var] + ([factor_a] if factor_a in corr_df.columns else [])].dropna()
     fig_scatter = px.scatter(
         df_plot,
         x=x_var,
@@ -550,7 +593,7 @@ def tab_2_results_for_selected_variable() -> None:
         color=factor_a if factor_a in df_plot.columns else None,
         trendline="ols" if method == "pearson" else None,
         template="simple_white",
-        title=f"Scatter: {x_var} vs {y_var} (color: {factor_a})",
+        title=f"Scatter: {x_var} vs {y_var}",
     )
     st.plotly_chart(fig_scatter, use_container_width=True)
 
