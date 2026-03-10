@@ -44,12 +44,11 @@ def init_state() -> None:
             report_bytes=None,
         )
 
-    # Variable elegida por el usuario (raw)
     st.session_state.setdefault("analysis_variable", None)
     st.session_state.setdefault("analysis_variable_label", None)
     st.session_state.setdefault("analysis_source", None)  # "raw" | "kpi"
 
-    # NUEVO: factor de agrupación (columna categórica)
+    # Factor de agrupación (columna categórica)
     st.session_state.setdefault("group_factor", "treatment")
 
 
@@ -114,9 +113,8 @@ def numeric_cols(df: pd.DataFrame, *, exclude: Optional[set[str]] = None) -> Lis
 
 def _categorical_candidates(df: pd.DataFrame) -> List[str]:
     """
-    Heurística para columnas que sirven como factor:
+    Columnas que sirven como factor:
     - object/string/bool/category
-    (excluye columnas típicamente numéricas aunque tengan pocos niveles)
     """
     out: List[str] = []
     for c in df.columns:
@@ -129,17 +127,46 @@ def _categorical_candidates(df: pd.DataFrame) -> List[str]:
             out.append(c)
         elif pd.api.types.is_categorical_dtype(s):
             out.append(c)
+
     # prefer treatment si existe
     if "treatment" in df.columns and "treatment" not in out:
         out.insert(0, "treatment")
     return out
 
 
+def _factor_selector(df: pd.DataFrame, *, label: str, key: str) -> str:
+    """
+    Selector reusable para factor de agrupación. Es el MISMO estado global:
+    - escribe en st.session_state["group_factor"]
+    """
+    candidates = _categorical_candidates(df)
+    if not candidates:
+        st.warning("No encontré columnas categóricas. Se intentará usar 'treatment' si existe.")
+        st.session_state["group_factor"] = "treatment"
+        return st.session_state["group_factor"]
+
+    default_factor = st.session_state.get("group_factor", "treatment")
+    if default_factor not in candidates:
+        default_factor = candidates[0]
+
+    factor = st.selectbox(
+        label,
+        options=candidates,
+        index=candidates.index(default_factor),
+        key=key,  # key único por pestaña, pero mismo valor en session_state
+    )
+    st.session_state["group_factor"] = factor
+
+    try:
+        n_levels = int(df[factor].astype(str).nunique(dropna=True))
+        st.caption(f"Niveles detectados en {factor}: {n_levels}")
+    except Exception:
+        pass
+
+    return factor
+
+
 def describe_by_group(df: pd.DataFrame, group_col: str, metric: str) -> pd.DataFrame:
-    """
-    Descriptiva por grupo mejorada:
-    - n, media, sd, cv_pct, min, p10, p25, mediana, p75, p90, max, rango
-    """
     if metric not in df.columns or group_col not in df.columns:
         return pd.DataFrame()
 
@@ -165,7 +192,10 @@ def describe_by_group(df: pd.DataFrame, group_col: str, metric: str) -> pd.DataF
     )
 
     g["rango"] = g["max"] - g["min"]
-    g["cv_pct"] = g.apply(lambda r: (np.nan if r["media"] == 0 else 100.0 * r["sd"] / abs(r["media"])), axis=1)
+    g["cv_pct"] = g.apply(
+        lambda r: (np.nan if r["media"] == 0 else 100.0 * r["sd"] / abs(r["media"])),
+        axis=1,
+    )
     g = g.sort_values(group_col).reset_index(drop=True)
     return g
 
@@ -390,11 +420,11 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
         )
 
 
-# ------------------------ TAB 1: Elegir variable + correr + factor ------------------------
+# ------------------------ TAB 1 ------------------------
 
 
 def tab_1_select_variable_and_run() -> None:
-    st.subheader("1) Selección de variable + factor + correr análisis")
+    st.subheader("1) Selección de variable + correr análisis")
 
     state = get_state()
     if state.parsed is None:
@@ -403,14 +433,11 @@ def tab_1_select_variable_and_run() -> None:
 
     hs = state.parsed.to_dataframes()["house_summary"].copy()
 
-    st.markdown("### Selecciona variable de trabajo (desde HOUSE_SUMMARY)")
-    st.caption("Esta selección funciona ANTES de correr el análisis (input crudo).")
-
+    st.markdown("### Variable principal")
     raw_exclude = {"trial_id", "unit_id", "unit_type"}
     raw_numeric = numeric_cols(hs, exclude=raw_exclude)
-
     if not raw_numeric:
-        st.warning("No se detectaron columnas numéricas en HOUSE_SUMMARY para seleccionar.")
+        st.warning("No se detectaron columnas numéricas en HOUSE_SUMMARY.")
         return
 
     raw_labels = {
@@ -425,88 +452,49 @@ def tab_1_select_variable_and_run() -> None:
         "bw_final_mean_g" if "bw_final_mean_g" in raw_numeric else raw_numeric[0]
     )
     idx = raw_numeric.index(default_raw) if default_raw in raw_numeric else 0
-
     sel = st.selectbox("Variable (raw)", options=raw_options, index=idx, key="sel_raw_var")
     chosen = raw_numeric[raw_options.index(sel)]
-
     st.session_state["analysis_variable"] = chosen
     st.session_state["analysis_variable_label"] = raw_labels.get(chosen, chosen)
     st.session_state["analysis_source"] = "raw"
 
-    st.success(f"Variable seleccionada: {st.session_state['analysis_variable_label']}")
-
     st.divider()
-    st.markdown("### Factor de comparación (agrupación)")
+    st.markdown("### Factor de agrupación (para descriptiva y gráficos)")
+    _factor_selector(hs, label="Factor (columna)", key="factor_select_tab1")
 
-    candidates = _categorical_candidates(hs)
-    if not candidates:
-        st.warning("No encontré columnas categóricas. Se intentará usar 'treatment' si existe.")
-        st.session_state["group_factor"] = "treatment"
-    else:
-        default_factor = st.session_state.get("group_factor", "treatment")
-        if default_factor not in candidates:
-            default_factor = candidates[0]
-
-        factor = st.selectbox(
-            "Selecciona la columna de agrupación (factor)",
-            options=candidates,
-            index=candidates.index(default_factor),
-            key="group_factor_selectbox",
-        )
-        st.session_state["group_factor"] = factor
-        levels = int(hs[factor].astype(str).nunique(dropna=True))
-        st.caption(f"Niveles detectados en {factor}: {levels}")
-
-    with st.expander("Vista previa de datos (opcional)", expanded=False):
-        show = st.toggle("Mostrar tabla HOUSE_SUMMARY", value=False, key="preview_show_hs")
+    with st.expander("Vista previa (opcional)", expanded=False):
+        show = st.toggle("Mostrar HOUSE_SUMMARY", value=False, key="preview_show_hs")
         if show:
             st.dataframe(hs.head(300), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.markdown("### Correr análisis (para habilitar KPIs y test de medias)")
+    st.markdown("### Correr análisis (KPIs / test de medias)")
     c1, c2, c3 = st.columns(3)
     with c1:
-        wg_negative_is_error = st.checkbox(
-            "Bloquear WG negativo (WG < 0)",
-            value=True,
-            key="run_wg_negative_is_error",
-        )
+        wg_negative_is_error = st.checkbox("Bloquear WG negativo (WG < 0)", value=True, key="run_wg_negative_is_error")
     with c2:
-        alpha = st.number_input(
-            "Alpha",
-            min_value=0.001,
-            max_value=0.2,
-            value=0.05,
-            step=0.005,
-            key="run_alpha",
-        )
+        alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="run_alpha")
     with c3:
-        enable_posthoc = st.checkbox(
-            "Posthoc (cuando aplique)",
-            value=True,
-            key="run_enable_posthoc",
-        )
+        enable_posthoc = st.checkbox("Posthoc (cuando aplique)", value=True, key="run_enable_posthoc")
 
     if st.button("Correr análisis ahora", type="primary", use_container_width=True, key="run_analysis_btn"):
-        run_analysis(
-            alpha=float(alpha),
-            enable_posthoc=bool(enable_posthoc),
-            wg_negative_is_error=bool(wg_negative_is_error),
-        )
+        run_analysis(alpha=float(alpha), enable_posthoc=bool(enable_posthoc), wg_negative_is_error=bool(wg_negative_is_error))
         st.success("Listo. Ve a la pestaña 2 para ver resultados.")
 
 
-# ------------------------ TAB 2: Resultados (factor flexible + correlación) ------------------------
+# ------------------------ TAB 2 ------------------------
 
 
 def tab_2_results_for_selected_variable() -> None:
-    st.subheader("2) Resultados (descriptiva + gráficos) — variable seleccionada")
+    st.subheader("2) Resultados — descriptiva + gráficos + correlación")
     _inject_table_css()
 
     state = get_state()
     if state.parsed is None:
         st.info("Carga un archivo primero.")
         return
+
+    hs = state.parsed.to_dataframes()["house_summary"].copy()
 
     var = st.session_state.get("analysis_variable")
     src = st.session_state.get("analysis_source")
@@ -515,19 +503,16 @@ def tab_2_results_for_selected_variable() -> None:
     if not var or src != "raw":
         st.warning("Selecciona la variable en la pestaña 1.")
         return
-
-    hs = state.parsed.to_dataframes()["house_summary"].copy()
-
-    group_col = st.session_state.get("group_factor", "treatment")
-    if group_col not in hs.columns:
-        st.error(f"No existe la columna de agrupación '{group_col}' en HOUSE_SUMMARY.")
-        return
     if var not in hs.columns:
         st.error(f"La variable seleccionada ({var}) no existe en HOUSE_SUMMARY.")
         return
 
-    n_units = int(len(hs))
+    # Selector de factor TAMBIÉN aquí (para que sea seleccionable en todas las hojas)
+    st.markdown("### Factor de agrupación")
+    group_col = _factor_selector(hs, label="Factor (columna)", key="factor_select_tab2")
+
     groups = sorted(hs[group_col].astype(str).dropna().unique().tolist())
+    n_units = int(len(hs))
     n_groups = int(len(groups))
     missing = int(hs[var].isna().sum())
     valid = int(hs[var].notna().sum())
@@ -537,27 +522,22 @@ def tab_2_results_for_selected_variable() -> None:
     c2.metric("Unidades", str(n_units))
     c3.metric("Grupos", str(n_groups))
     c4.metric("Válidos", str(valid))
-    st.caption(f"Agrupando por: **{group_col}**")
 
     st.divider()
-    st.markdown("### Datos de la variable seleccionada")
-
+    st.markdown("### Datos (auditoría)")
     cols_show = [c for c in ["trial_id", "unit_id", "unit_type", group_col] if c in hs.columns] + [var]
     data_view = hs[cols_show].copy()
     sort_cols = [c for c in [group_col, "unit_id"] if c in data_view.columns]
     if sort_cols:
         data_view = data_view.sort_values(sort_cols, kind="stable")
-
     with st.expander("Ver tabla de datos", expanded=True):
         st.dataframe(data_view, use_container_width=True, hide_index=True)
 
     st.divider()
-    st.markdown("### Resumen descriptivo por grupo (mejorado)")
-
+    st.markdown("### Resumen descriptivo por grupo")
     decimals = st.slider("Decimales", 0, 6, 2, key="tab2_desc_decimals")
     desc = describe_by_group(hs, group_col, var)
-    desc_fmt = _format_desc_table(desc, group_col=group_col, decimals=decimals)
-    st.dataframe(desc_fmt, use_container_width=True, hide_index=True)
+    st.dataframe(_format_desc_table(desc, group_col=group_col, decimals=decimals), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Supuestos (informativo)")
@@ -570,7 +550,6 @@ def tab_2_results_for_selected_variable() -> None:
 
     st.divider()
     st.markdown("### Gráficos")
-
     try:
         import plotly.express as px
     except Exception:
@@ -605,7 +584,6 @@ def tab_2_results_for_selected_variable() -> None:
 
     st.divider()
     st.markdown("### Correlación entre variables (2×2)")
-
     numeric_candidates = numeric_cols(hs, exclude={"trial_id", "unit_id", "unit_type"})
     if len(numeric_candidates) < 2:
         st.info("No hay suficientes variables numéricas para correlación.")
@@ -646,18 +624,13 @@ def tab_2_results_for_selected_variable() -> None:
         return
 
     corr = _correlation_stats(df_corr_base[x_var], df_corr_base[y_var], method=method)
-
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("n (pares)", str(corr["n"]))
     k2.metric("r", "—" if corr["r"] is None else f"{corr['r']:.4f}")
     k3.metric("r²", "—" if corr["r2"] is None else f"{corr['r2']:.4f}")
     k4.metric("p-value", "—" if corr["p_value"] is None else f"{corr['p_value']:.4g}")
 
-    if corr.get("note"):
-        st.caption(str(corr["note"]))
-
     df_plot = df_corr_base[[x_var, y_var, group_col]].dropna()
-
     if scope == "Toda la población":
         figc = px.scatter(
             df_plot,
@@ -677,23 +650,28 @@ def tab_2_results_for_selected_variable() -> None:
             template="simple_white",
             title=f"Correlación ({method}) — por {group_col}: {x_var} vs {y_var}",
         )
-
     st.plotly_chart(figc, use_container_width=True)
 
 
-# ------------------------ TAB 3: Test de medias (pendiente factor flexible en core) ------------------------
+# ------------------------ TAB 3 ------------------------
 
 
 def tab_3_mean_tests() -> None:
-    st.subheader("3) Test de medias (ANOVA / posthoc) + tratamientos a comparar")
+    st.subheader("3) Test de medias — (nota: inferencial aún usa 'treatment' en core)")
 
     state = get_state()
     if state.units is None or state.unit_kpis_df is None:
         st.info("Primero corre el análisis en la pestaña 1.")
         return
 
+    # selector de factor también aquí (consistencia UI)
+    hs = state.parsed.to_dataframes()["house_summary"].copy() if state.parsed else pd.DataFrame()
+    if not hs.empty:
+        st.markdown("### Factor de agrupación (solo UI por ahora)")
+        _factor_selector(hs, label="Factor (columna)", key="factor_select_tab3")
+        st.info("Para que el ANOVA use el factor elegido, hay que actualizar `pcta/core/stats.py` para aceptar `group_col`.")
+
     var = st.session_state.get("analysis_variable")
-    label = st.session_state.get("analysis_variable_label") or var
     if not var:
         st.warning("Selecciona variable en la pestaña 1.")
         return
@@ -701,83 +679,31 @@ def tab_3_mean_tests() -> None:
     kpi_cols = numeric_kpi_columns(state.unit_kpis_df)
     if var not in kpi_cols:
         st.warning(
-            f"La variable seleccionada ({var}) es de input crudo y no está disponible como KPI calculado. "
-            "Para ANOVA/posthoc, selecciona una variable KPI (ej: bw_final_mean_g, fcr, wg_g_per_bird)."
+            f"La variable seleccionada ({var}) no está disponible como KPI calculado. "
+            "Para test de medias, elige un KPI (ej: bw_final_mean_g, fcr, wg_g_per_bird)."
         )
         return
 
     treatments_all = sorted(state.unit_kpis_df["treatment"].astype(str).unique().tolist())
-    selected_trts = st.multiselect(
-        "Tratamientos a comparar",
-        options=treatments_all,
-        default=treatments_all,
-        key="mean_tests_selected_trts",
-    )
-
+    selected_trts = st.multiselect("Tratamientos a comparar", options=treatments_all, default=treatments_all, key="mean_tests_selected_trts")
     if len(selected_trts) < 2:
         st.warning("Selecciona al menos 2 tratamientos.")
         return
 
-    st.divider()
-    st.markdown("### Método")
-    _ = st.selectbox(
-        "Test de medias",
-        options=[
-            "AUTO (según supuestos)",
-            "ANOVA (pendiente)",
-            "Welch ANOVA (pendiente)",
-            "Kruskal-Wallis (pendiente)",
-        ],
-        index=0,
-        key="mean_tests_mode",
-    )
     enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="mean_tests_posthoc")
-    alpha = st.number_input(
-        "Alpha",
-        min_value=0.001,
-        max_value=0.2,
-        value=0.05,
-        step=0.005,
-        key="mean_tests_alpha",
-    )
+    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="mean_tests_alpha")
 
     if st.button("Calcular test de medias", type="primary", key="mean_tests_run"):
-        try:
-            units_filtered = [u for u in state.units if str(u.treatment) in set(selected_trts)]
-            computed, _ = compute_all_units(units_filtered)
-
-            stats_df, rep_by_trt, min_n, enabled, warnings = run_inferential_statistics(
-                computed,
-                metrics=[var],
-                options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
-            )
-
-            st.markdown(f"### Resultado: {label}")
-            st.dataframe(stats_df, use_container_width=True, hide_index=True)
-
-            try:
-                import plotly.express as px
-            except Exception:
-                st.error("No está instalado Plotly.")
-                return
-
-            df = pd.DataFrame([m.model_dump() for m in computed])
-            fig = px.box(
-                df[df["treatment"].astype(str).isin(selected_trts)],
-                x="treatment",
-                y=var,
-                points="all",
-                template="simple_white",
-                title=f"{label} — tratamientos seleccionados",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            if warnings:
-                st.markdown("### Advertencias")
-                st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
-
-        except Exception as e:
-            st.error(f"No se pudo calcular el test: {e}")
+        units_filtered = [u for u in state.units if str(u.treatment) in set(selected_trts)]
+        computed, _ = compute_all_units(units_filtered)
+        stats_df, rep_by_trt, min_n, enabled, warnings = run_inferential_statistics(
+            computed,
+            metrics=[var],
+            options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
+        )
+        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+        if warnings:
+            st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
 
 
 # ------------------------ Export ------------------------
@@ -797,3 +723,4 @@ def tab_export() -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+    
