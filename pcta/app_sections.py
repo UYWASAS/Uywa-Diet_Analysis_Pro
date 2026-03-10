@@ -11,13 +11,10 @@ import streamlit as st
 from scipy import stats as sps
 
 from pcta.auth import logout_button
-from pcta.core.calculations import compute_all_units
 from pcta.core.factorial_stats import FactorialOptions, run_factorial_anova_df
-from pcta.core.io import export_report_xlsx, parse_uploaded_file
-from pcta.core.reporting import build_treatment_summary, default_metric_list
-from pcta.core.schemas import AnalysisWarning, ExportPayload, ParsedInput, TrialUnitInput
-from pcta.core.stats import StatsOptions, run_inferential_statistics, run_inferential_statistics_df
-from pcta.core.validation import ValidationOptions, validate_units
+from pcta.core.io import parse_uploaded_file
+from pcta.core.schemas import AnalysisWarning, ParsedInput
+from pcta.core.stats import StatsOptions, run_inferential_statistics_df
 
 
 # ------------------------ Estado ------------------------
@@ -26,63 +23,41 @@ from pcta.core.validation import ValidationOptions, validate_units
 @dataclass(frozen=True)
 class AppState:
     parsed: Optional[ParsedInput]
-    units: Optional[List[TrialUnitInput]]
-    unit_kpis_df: Optional[pd.DataFrame]
-    treatment_summary_df: Optional[pd.DataFrame]
-    stats_df: Optional[pd.DataFrame]
     warnings: List[AnalysisWarning]
-    report_bytes: Optional[bytes]
 
 
 def init_state() -> None:
     if "pcta_state" not in st.session_state:
-        st.session_state["pcta_state"] = AppState(
-            parsed=None,
-            units=None,
-            unit_kpis_df=None,
-            treatment_summary_df=None,
-            stats_df=None,
-            warnings=[],
-            report_bytes=None,
-        )
+        st.session_state["pcta_state"] = AppState(parsed=None, warnings=[])
 
-    # Modo libre (cualquier Excel/CSV)
+    # Modo libre
+    st.session_state.setdefault("raw_mode", False)
     st.session_state.setdefault("raw_df", None)  # pd.DataFrame | None
-    st.session_state.setdefault("raw_mode", False)  # bool
-    st.session_state.setdefault("raw_sheet_name", None)  # str | None
+    st.session_state.setdefault("raw_sheet_name", None)
 
-    # Selección explícita (no asumir nombres)
-    st.session_state.setdefault("dv_col", None)  # Y
-    st.session_state.setdefault("factor_a", None)  # factor principal
-    st.session_state.setdefault("factor_b", None)  # segundo factor
-    st.session_state.setdefault("block_col", None)  # bloque (opcional)
-    st.session_state.setdefault("filters", {})  # dict[col] -> list[level strings]
+    # Selecciones de análisis
+    st.session_state.setdefault("dv_col", None)
+    st.session_state.setdefault("factor_a", None)
+    st.session_state.setdefault("factor_b", None)
+    st.session_state.setdefault("block_col", None)
+    st.session_state.setdefault("filters", {})
 
     # Correlación
     st.session_state.setdefault("corr_x", None)
     st.session_state.setdefault("corr_y", None)
+    st.session_state.setdefault("corr_method", "pearson")
 
-    # Compatibilidad con UI anterior
-    st.session_state.setdefault("analysis_variable", None)
-    st.session_state.setdefault("analysis_variable_label", None)
-    st.session_state.setdefault("analysis_source", "raw")
+    # Plots
+    st.session_state.setdefault("show_violin", True)
+    st.session_state.setdefault("show_points", True)
 
 
 def get_state() -> AppState:
     return st.session_state["pcta_state"]
 
 
-def set_state(**kwargs) -> None:
-    cur: AppState = st.session_state["pcta_state"]
-    st.session_state["pcta_state"] = AppState(
-        parsed=kwargs.get("parsed", cur.parsed),
-        units=kwargs.get("units", cur.units),
-        unit_kpis_df=kwargs.get("unit_kpis_df", cur.unit_kpis_df),
-        treatment_summary_df=kwargs.get("treatment_summary_df", cur.treatment_summary_df),
-        stats_df=kwargs.get("stats_df", cur.stats_df),
-        warnings=kwargs.get("warnings", cur.warnings),
-        report_bytes=kwargs.get("report_bytes", cur.report_bytes),
-    )
+def set_state(*, parsed: Optional[ParsedInput], warnings: List[AnalysisWarning]) -> None:
+    st.session_state["pcta_state"] = AppState(parsed=parsed, warnings=warnings)
 
 
 # ------------------------ Helpers ------------------------
@@ -106,12 +81,6 @@ def _inject_table_css() -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-def warnings_df(warnings: List[AnalysisWarning]) -> pd.DataFrame:
-    if not warnings:
-        return pd.DataFrame(columns=["codigo", "mensaje", "contexto"])
-    return pd.DataFrame([{"codigo": w.code.value, "mensaje": w.message, "contexto": w.context} for w in warnings])
 
 
 def numeric_cols(df: pd.DataFrame) -> List[str]:
@@ -152,39 +121,31 @@ def _read_excel_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
 
 
 def get_active_df() -> Optional[pd.DataFrame]:
-    """
-    DataFrame activo para análisis flexible:
-    - Modo libre: raw_df
-    - Modo estándar: parsed house_summary
-    """
     if st.session_state.get("raw_mode") and isinstance(st.session_state.get("raw_df"), pd.DataFrame):
         return st.session_state["raw_df"]
 
     state = get_state()
     if state.parsed is None:
         return None
-
     dfs = state.parsed.to_dataframes()
     if "house_summary" in dfs:
         return dfs["house_summary"].copy()
+    if dfs:
+        return next(iter(dfs.values())).copy()
     return None
 
 
 def render_design_controls(
     df: pd.DataFrame, *, prefix_key: str
 ) -> Tuple[str, str, Optional[str], Optional[str], Dict[str, List[str]]]:
-    """
-    Selección explícita de DV (Y) + factores + bloque + filtros.
-    """
     num = numeric_cols(df)
     cat = categorical_cols(df)
 
     if not num:
-        st.error("No hay columnas numéricas disponibles para Y.")
+        st.error("No hay columnas numéricas para Y.")
         return "", "", None, None, {}
-
     if not cat:
-        st.error("No hay columnas categóricas disponibles para factores/filtros.")
+        st.error("No hay columnas categóricas para factores/filtros.")
         return "", "", None, None, {}
 
     dv_default = st.session_state.get("dv_col")
@@ -197,9 +158,6 @@ def render_design_controls(
 
     dv_col = st.selectbox("Variable dependiente (Y)", options=num, index=num.index(dv_default), key=f"{prefix_key}_dv")
     st.session_state["dv_col"] = dv_col
-    st.session_state["analysis_variable"] = dv_col
-    st.session_state["analysis_variable_label"] = dv_col
-    st.session_state["analysis_source"] = "raw"
 
     factor_a = st.selectbox("Factor A (principal)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa")
     st.session_state["factor_a"] = factor_a
@@ -208,7 +166,6 @@ def render_design_controls(
     fb_default = st.session_state.get("factor_b")
     if fb_default not in b_opts:
         fb_default = None
-
     factor_b = st.selectbox(
         "Factor B (opcional)",
         options=b_opts,
@@ -222,7 +179,6 @@ def render_design_controls(
     block_default = st.session_state.get("block_col")
     if block_default not in block_opts:
         block_default = None
-
     block_col = st.selectbox(
         "Bloque (opcional)",
         options=block_opts,
@@ -234,7 +190,6 @@ def render_design_controls(
 
     st.markdown("#### Bloqueos / filtros (pre-análisis)")
     filter_cols = st.multiselect("Columnas a filtrar", options=cat, default=[], key=f"{prefix_key}_filter_cols")
-
     filters: Dict[str, List[str]] = {}
     for col in filter_cols:
         levels = sorted(df[col].dropna().astype(str).unique().tolist())
@@ -245,8 +200,8 @@ def render_design_controls(
             key=f"{prefix_key}_filter_levels_{col}",
         )
         filters[col] = chosen
-
     st.session_state["filters"] = filters
+
     return dv_col, factor_a, factor_b, block_col, filters
 
 
@@ -351,7 +306,7 @@ def correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, obje
     return {"n": n, "r": float(r), "r2": float(r * r), "p_value": float(p)}
 
 
-# ------------------------ Sidebar minimal ------------------------
+# ------------------------ Sidebar ------------------------
 
 
 @dataclass(frozen=True)
@@ -379,8 +334,8 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
         )
 
         logout_button()
-        st.divider()
 
+        st.divider()
         st.subheader("Carga de archivos")
         uploaded_main = st.file_uploader(
             "Ensayo (Excel .xlsx o CSV .csv)",
@@ -392,41 +347,31 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
     return SidebarResult(uploaded_main=uploaded_main)
 
 
-# ------------------------ Load: strict parse or free mode ------------------------
+# ------------------------ Carga (estricto o libre) ------------------------
 
 
 def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
-    """
-    Intenta parseo estricto (modo estándar). Si falla, activa Modo Libre y carga un DataFrame con pandas.
-    """
     if uploaded_main is None:
         return
 
     file_name = uploaded_main.name
     file_bytes = uploaded_main.getvalue()
 
-    # Reset upload-derived state
-    st.session_state["raw_df"] = None
+    # Reset
     st.session_state["raw_mode"] = False
+    st.session_state["raw_df"] = None
     st.session_state["raw_sheet_name"] = None
 
-    # Strict parse (legacy)
+    # 1) Intento parseo estricto
     try:
         parsed = parse_uploaded_file(file_name, file_bytes)
-        set_state(
-            parsed=parsed,
-            units=None,
-            unit_kpis_df=None,
-            treatment_summary_df=None,
-            stats_df=None,
-            warnings=[],
-            report_bytes=None,
-        )
+        set_state(parsed=parsed, warnings=[])
         return
     except Exception as e:
         st.warning(f"Modo PCTA estándar no aplica. Activando Modo Libre. Detalle: {e}")
+        set_state(parsed=None, warnings=[])
 
-    # Free mode
+    # 2) Modo libre
     lower = file_name.lower()
 
     if lower.endswith(".xlsx"):
@@ -440,29 +385,13 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
             sheet = st.selectbox("Hoja", options=sheets, index=0, key="raw_sheet_select")
 
         st.session_state["raw_sheet_name"] = sheet
-        try:
-            df = _read_excel_sheet(file_bytes, sheet_name=sheet)
-        except Exception as e:
-            st.error(f"No pude leer la hoja '{sheet}': {e}")
-            return
-
+        st.session_state["raw_df"] = _read_excel_sheet(file_bytes, sheet_name=sheet)
         st.session_state["raw_mode"] = True
-        st.session_state["raw_df"] = df
-
-        set_state(parsed=None, units=None, unit_kpis_df=None, treatment_summary_df=None, stats_df=None, warnings=[], report_bytes=None)
         return
 
     if lower.endswith(".csv"):
-        try:
-            df = pd.read_csv(BytesIO(file_bytes))
-        except Exception as e:
-            st.error(f"No pude leer el CSV en Modo Libre: {e}")
-            return
-
+        st.session_state["raw_df"] = pd.read_csv(BytesIO(file_bytes))
         st.session_state["raw_mode"] = True
-        st.session_state["raw_df"] = df
-
-        set_state(parsed=None, units=None, unit_kpis_df=None, treatment_summary_df=None, stats_df=None, warnings=[], report_bytes=None)
         return
 
     st.error("Formato no soportado. Sube un .xlsx o .csv.")
@@ -480,14 +409,13 @@ def tab_1_select_variable_and_run() -> None:
         return
 
     if st.session_state.get("raw_mode"):
-        st.caption("Modo Libre activado: no se requieren nombres estándar de columnas/hojas.")
+        st.caption("Modo Libre activado: puedes elegir columnas con cualquier nombre.")
 
-    st.markdown("### Diseño del análisis")
-    render_design_controls(df, prefix_key="tab1_design")
+    render_design_controls(df, prefix_key="tab1")
 
 
 def tab_2_results_for_selected_variable() -> None:
-    st.subheader("2) Resultados (descriptivo + correlación)")
+    st.subheader("2) Resultados (descriptivo + distribuciones + correlación)")
     _inject_table_css()
 
     df = get_active_df()
@@ -495,22 +423,84 @@ def tab_2_results_for_selected_variable() -> None:
         st.info("Carga un archivo primero.")
         return
 
-    st.markdown("### Diseño (puedes ajustar aquí)")
-    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2_design")
-
+    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2")
     df_f = apply_filters(df, filters)
+
     if df_f.empty:
-        st.error("Con los filtros actuales no quedan filas para analizar.")
+        st.error("Con los filtros actuales no quedan filas.")
         return
 
     group_cols = [factor_a] + ([factor_b] if factor_b else [])
 
-    st.divider()
+    # --- Descriptiva ---
     st.markdown("### Resumen descriptivo")
     decimals = st.slider("Decimales", 0, 6, 2, key="tab2_decimals")
     desc = describe_by_group(df_f, group_cols, dv_col)
     st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
 
+    # --- Distribuciones / gráficos ---
+    st.divider()
+    st.markdown("### Distribuciones (gráficas)")
+
+    try:
+        import plotly.express as px
+    except Exception:
+        st.error("Plotly no está instalado.")
+        return
+
+    # Histograma de Y
+    y_series = df_f[dv_col].dropna()
+    if y_series.empty:
+        st.warning("No hay datos válidos para graficar Y.")
+    else:
+        bins = st.slider("Bins (histograma)", 5, 100, 30, key="hist_bins")
+        fig_hist = px.histogram(df_f, x=dv_col, nbins=bins, template="simple_white", title=f"Distribución de Y: {dv_col}")
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    # Box/violin por Factor A (y color por B si existe)
+    show_violin = st.checkbox("Ver violin plot", value=True, key="show_violin")
+    show_points = st.checkbox("Mostrar puntos (strip)", value=True, key="show_points")
+
+    if factor_b:
+        fig_box = px.violin(
+            df_f,
+            x=factor_a,
+            y=dv_col,
+            color=factor_b,
+            box=True,
+            points="all" if show_points else False,
+            template="simple_white",
+            title=f"Distribución de {dv_col} por {factor_a} (color: {factor_b})",
+        ) if show_violin else px.box(
+            df_f,
+            x=factor_a,
+            y=dv_col,
+            color=factor_b,
+            points="all" if show_points else False,
+            template="simple_white",
+            title=f"{dv_col} por {factor_a} (color: {factor_b})",
+        )
+    else:
+        fig_box = px.violin(
+            df_f,
+            x=factor_a,
+            y=dv_col,
+            box=True,
+            points="all" if show_points else False,
+            template="simple_white",
+            title=f"Distribución de {dv_col} por {factor_a}",
+        ) if show_violin else px.box(
+            df_f,
+            x=factor_a,
+            y=dv_col,
+            points="all" if show_points else False,
+            template="simple_white",
+            title=f"{dv_col} por {factor_a}",
+        )
+
+    st.plotly_chart(fig_box, use_container_width=True)
+
+    # --- Supuestos ---
     st.divider()
     st.markdown("### Supuestos (informativo; sobre Factor A)")
     tests = homogeneity_tests(df_f, factor_a, dv_col)
@@ -518,17 +508,28 @@ def tab_2_results_for_selected_variable() -> None:
     c1.metric("Levene p", "—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}")
     c2.metric("Shapiro min p", "—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}")
 
+    # --- Correlación ---
     st.divider()
-    st.markdown("### Correlación 2×2 (post-filtro)")
+    st.markdown("### Correlación 2×2 (con gráfica)")
     num = numeric_cols(df_f)
     if len(num) < 2:
         st.info("No hay suficientes variables numéricas para correlación.")
         return
 
-    x_var = st.selectbox("Variable X", options=num, index=0, key="corr_x")
-    y_idx = 1 if len(num) > 1 else 0
-    y_var = st.selectbox("Variable Y", options=num, index=y_idx, key="corr_y")
-    method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
+    x_default = st.session_state.get("corr_x") or num[0]
+    y_default = st.session_state.get("corr_y") or (num[1] if len(num) > 1 else num[0])
+    if x_default not in num:
+        x_default = num[0]
+    if y_default not in num:
+        y_default = num[1] if len(num) > 1 else num[0]
+
+    cL, cM, cR = st.columns([1, 1, 1])
+    with cL:
+        x_var = st.selectbox("Variable X", options=num, index=num.index(x_default), key="corr_x")
+    with cM:
+        y_var = st.selectbox("Variable Y", options=num, index=num.index(y_default), key="corr_y")
+    with cR:
+        method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
 
     if x_var == y_var:
         st.warning("Selecciona X ≠ Y.")
@@ -541,29 +542,36 @@ def tab_2_results_for_selected_variable() -> None:
     k3.metric("r²", "—" if corr["r2"] is None else f"{corr['r2']:.4f}")
     k4.metric("p-value", "—" if corr["p_value"] is None else f"{corr['p_value']:.4g}")
 
+    df_plot = df_f[[x_var, y_var] + ([factor_a] if factor_a in df_f.columns else [])].dropna()
+    fig_scatter = px.scatter(
+        df_plot,
+        x=x_var,
+        y=y_var,
+        color=factor_a if factor_a in df_plot.columns else None,
+        trendline="ols" if method == "pearson" else None,
+        template="simple_white",
+        title=f"Scatter: {x_var} vs {y_var} (color: {factor_a})",
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+
 
 def tab_3_mean_tests() -> None:
     st.subheader("3) Inferencial (RAW flexible)")
-
     df = get_active_df()
     if df is None:
         st.info("Carga un archivo primero.")
         return
 
-    st.markdown("### Diseño (puedes ajustar aquí)")
-    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab3_design")
-
+    dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab3")
     df_f = apply_filters(df, filters)
+
     if df_f.empty:
         st.error("Con los filtros actuales no quedan filas para analizar.")
         return
 
-    st.divider()
-    st.markdown("### Opciones inferenciales")
-    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="tab3_alpha")
+    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="alpha_tab3")
 
     if factor_b:
-        st.markdown("## ANOVA factorial (A×B)")
         include_interaction = st.checkbox("Incluir interacción A:B", value=True, key="tab3_interaction")
         anova_type = st.selectbox("Tipo de ANOVA", options=[2, 3], index=0, key="tab3_anova_type")
         use_block = st.checkbox("Incluir bloque como efecto fijo", value=bool(block_col), key="tab3_use_block")
@@ -576,39 +584,21 @@ def tab_3_mean_tests() -> None:
             block_col=block_col if (use_block and block_col) else None,
             options=FactorialOptions(alpha=float(alpha), include_interaction=bool(include_interaction), anova_type=int(anova_type)),
         )
-
         st.caption(f"Fórmula: `{meta.get('formula','')}`")
         st.caption(f"min n por celda (A×B): {meta.get('min_n_per_cell')}")
         st.dataframe(aov_df, use_container_width=True, hide_index=True)
-
-        if warnings:
-            st.markdown("### Advertencias")
-            st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
         return
 
-    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_enable_posthoc")
+    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_posthoc")
     stats_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
         df_f,
         metric=dv_col,
         group_col=factor_a,
         options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
     )
-
-    st.markdown("### Replicación por grupo")
-    rep_df = pd.DataFrame([{"grupo": k, "n": int(v)} for k, v in sorted(rep.items(), key=lambda kv: str(kv[0]))])
-    st.dataframe(rep_df, use_container_width=True, hide_index=True)
-
-    st.markdown("### Resultado inferencial")
     st.dataframe(stats_df, use_container_width=True, hide_index=True)
-
-    if warnings:
-        st.markdown("### Advertencias")
-        st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
-
-    if not enabled:
-        st.warning("Inferencia deshabilitada: se requiere al menos n>=2 por grupo (Factor A) para p-values.")
 
 
 def tab_export() -> None:
     st.subheader("Exportar")
-    st.info("Export está deshabilitado temporalmente para Modo Libre. (Lo habilitamos en el siguiente paso).")
+    st.info("Export en modo libre: pendiente (lo agregamos si lo necesitas).")
