@@ -11,6 +11,7 @@ from scipy import stats as sps
 
 from pcta.auth import logout_button
 from pcta.core.calculations import compute_all_units
+from pcta.core.factorial_stats import FactorialOptions, run_factorial_anova_df
 from pcta.core.io import export_report_xlsx, parse_uploaded_file
 from pcta.core.reporting import build_treatment_summary, default_metric_list
 from pcta.core.schemas import AnalysisWarning, ExportPayload, ParsedInput, TrialUnitInput
@@ -47,8 +48,8 @@ def init_state() -> None:
     # Selección explícita (no asumir nombres)
     st.session_state.setdefault("dv_col", None)  # Y
     st.session_state.setdefault("factor_a", None)  # tratamiento-like
-    st.session_state.setdefault("factor_b", None)  # segundo factor (solo descriptivo por ahora)
-    st.session_state.setdefault("block_col", None)  # bloque (por ahora solo filtro/estratificación visual)
+    st.session_state.setdefault("factor_b", None)  # segundo factor
+    st.session_state.setdefault("block_col", None)  # bloque (opcional)
     st.session_state.setdefault("filters", {})  # dict[col] -> list[level strings]
 
     # Correlación
@@ -156,70 +157,55 @@ def render_design_controls(
         st.error("No hay columnas categóricas disponibles para factores/filtros.")
         return "", "", None, None, {}
 
-    # DV default: si ya había elección, úsala; si no, intenta usar analysis_variable; si no, primera numérica
     dv_default = st.session_state.get("dv_col") or (
         st.session_state.get("analysis_variable") if st.session_state.get("analysis_variable") in num else num[0]
     )
     if dv_default not in num:
         dv_default = num[0]
 
-    # Factor A default: si ya había elección, úsala; si no, usa 'treatment' si existe; si no, primera categórica
     fa_default = st.session_state.get("factor_a")
     if fa_default not in cat:
         fa_default = "treatment" if "treatment" in cat else cat[0]
 
-    # DV
-    dv_col = st.selectbox(
-        "Variable dependiente (Y)",
-        options=num,
-        index=num.index(dv_default),
-        key=f"{prefix_key}_dv_col",
-    )
+    dv_col = st.selectbox("Variable dependiente (Y)", options=num, index=num.index(dv_default), key=f"{prefix_key}_dv")
     st.session_state["dv_col"] = dv_col
     st.session_state["analysis_variable"] = dv_col
     st.session_state["analysis_variable_label"] = dv_col
     st.session_state["analysis_source"] = "raw"
 
-    # Factor A
     factor_a = st.selectbox(
-        "Factor A (principal / tratamiento)",
-        options=cat,
-        index=cat.index(fa_default),
-        key=f"{prefix_key}_factor_a",
+        "Factor A (principal / tratamiento)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa"
     )
     st.session_state["factor_a"] = factor_a
 
-    # Factor B opcional
     b_opts = [None] + [c for c in cat if c != factor_a]
     fb_default = st.session_state.get("factor_b")
     if fb_default not in b_opts:
         fb_default = None
 
     factor_b = st.selectbox(
-        "Factor B (opcional, factorial A×B) — (descriptivo/plots)",
+        "Factor B (opcional)",
         options=b_opts,
         format_func=lambda v: "— Ninguno —" if v is None else str(v),
         index=b_opts.index(fb_default),
-        key=f"{prefix_key}_factor_b",
+        key=f"{prefix_key}_fb",
     )
     st.session_state["factor_b"] = factor_b
 
-    # Bloque opcional
     block_opts = [None] + [c for c in cat if c not in {factor_a, factor_b}]
     block_default = st.session_state.get("block_col")
     if block_default not in block_opts:
         block_default = None
 
     block_col = st.selectbox(
-        "Bloque (opcional) — (por ahora solo para filtros/estratificación)",
+        "Bloque (opcional)",
         options=block_opts,
         format_func=lambda v: "— Ninguno —" if v is None else str(v),
         index=block_opts.index(block_default),
-        key=f"{prefix_key}_block_col",
+        key=f"{prefix_key}_block",
     )
     st.session_state["block_col"] = block_col
 
-    # Filters
     st.markdown("#### Bloqueos / filtros (pre-análisis)")
     prev_filter_cols = list(st.session_state.get("filters", {}).keys())
     filter_cols = st.multiselect(
@@ -234,7 +220,6 @@ def render_design_controls(
         levels = sorted(df[col].dropna().astype(str).unique().tolist())
         default_levels = st.session_state.get("filters", {}).get(col, levels)
         default_levels = [x for x in default_levels if x in levels] or levels
-
         chosen = st.multiselect(
             f"Niveles permitidos: {col}",
             options=levels,
@@ -429,14 +414,10 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
         )
 
 
-# ------------------------ Pipeline (KPIs / export) ------------------------
+# ------------------------ Pipeline (KPIs / export legado) ------------------------
 
 
 def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bool) -> None:
-    """
-    Conserva el pipeline KPI para reporte/export.
-    El modo flexible (Y/A/B/filtros) trabaja sobre RAW en pestañas 2/3 vía run_inferential_statistics_df.
-    """
     state = get_state()
     if state.parsed is None:
         st.error("Primero carga el archivo principal.")
@@ -455,7 +436,7 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
             computed,
             metrics=metrics_default,
             options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
-            group_col="treatment",  # legacy export
+            group_col="treatment",  # export legado
         )
 
         all_warnings = [*v_warnings, *c_warnings, *s_warnings]
@@ -483,7 +464,7 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
         set_state(units=None, unit_kpis_df=None, treatment_summary_df=None, stats_df=None, warnings=[], report_bytes=None)
 
 
-# ------------------------ TAB 1: Diseño + correr análisis ------------------------
+# ------------------------ TAB 1 ------------------------
 
 
 def tab_1_select_variable_and_run() -> None:
@@ -511,10 +492,10 @@ def tab_1_select_variable_and_run() -> None:
 
     if st.button("Correr análisis ahora", type="primary", use_container_width=True, key="run_analysis_btn"):
         run_analysis(alpha=float(alpha), enable_posthoc=bool(enable_posthoc), wg_negative_is_error=bool(wg_negative_is_error))
-        st.success("Listo. Ve a la pestaña 2 para descriptiva / correlación y pestaña 3 para inferencial raw.")
+        st.success("Listo. Ve a la pestaña 2 (descriptivo) y 3 (inferencial).")
 
 
-# ------------------------ TAB 2: Descriptiva flexible + correlación ------------------------
+# ------------------------ TAB 2 ------------------------
 
 
 def tab_2_results_for_selected_variable() -> None:
@@ -546,11 +527,7 @@ def tab_2_results_for_selected_variable() -> None:
 
     st.divider()
     st.markdown("### Resumen descriptivo")
-    if factor_b:
-        st.caption(f"Factorial: {factor_a} × {factor_b}")
-    else:
-        st.caption(f"Por: {factor_a}")
-
+    st.caption("Factorial" if factor_b else "1-factor")
     decimals = st.slider("Decimales", 0, 6, 2, key="tab2_decimals")
     desc = describe_by_group(hs_f, group_cols, dv_col)
     st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
@@ -609,11 +586,11 @@ def tab_2_results_for_selected_variable() -> None:
     st.plotly_chart(figc, use_container_width=True)
 
 
-# ------------------------ TAB 3: Inferencial RAW flexible (1 factor) ------------------------
+# ------------------------ TAB 3 ------------------------
 
 
 def tab_3_mean_tests() -> None:
-    st.subheader("3) Inferencial (RAW flexible — Factor A)")
+    st.subheader("3) Inferencial (RAW flexible)")
 
     state = get_state()
     if state.parsed is None:
@@ -632,16 +609,38 @@ def tab_3_mean_tests() -> None:
 
     st.divider()
     st.markdown("### Opciones inferenciales")
-    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_enable_posthoc")
     alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="tab3_alpha")
+    enable_posthoc = st.checkbox("Posthoc (solo 1-factor)", value=True, key="tab3_enable_posthoc")
 
-    if factor_b is not None:
-        st.info(
-            "Nota: por ahora el inferencial aquí corre solo con Factor A (1-factor). "
-            "El factorial (A×B) lo implementamos en el siguiente paso con statsmodels."
+    # Factorial
+    if factor_b:
+        st.markdown("## ANOVA factorial (A×B)")
+        include_interaction = st.checkbox("Incluir interacción A:B", value=True, key="tab3_interaction")
+        anova_type = st.selectbox("Tipo de ANOVA", options=[2, 3], index=0, key="tab3_anova_type")
+        use_block = st.checkbox("Incluir bloque como efecto fijo", value=bool(block_col), key="tab3_use_block")
+
+        aov_df, meta, warnings = run_factorial_anova_df(
+            hs_f,
+            y_col=dv_col,
+            factor_a=factor_a,
+            factor_b=factor_b,
+            block_col=block_col if (use_block and block_col) else None,
+            options=FactorialOptions(alpha=float(alpha), include_interaction=bool(include_interaction), anova_type=int(anova_type)),
         )
 
-    # Inferencial RAW usando group_col flexible
+        st.caption(f"Fórmula: `{meta.get('formula','')}`")
+        st.caption(f"min n por celda (A×B): {meta.get('min_n_per_cell')}")
+        st.dataframe(aov_df, use_container_width=True, hide_index=True)
+
+        if warnings:
+            st.markdown("### Advertencias")
+            st.dataframe(warnings_df(warnings), use_container_width=True, hide_index=True)
+
+        st.info("Posthoc factorial no está incluido aún (si lo necesitas, lo agregamos).")
+        return
+
+    # 1-factor (A)
+    st.markdown("## Inferencia 1-factor (Factor A)")
     stats_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
         hs_f,
         metric=dv_col,
@@ -649,13 +648,11 @@ def tab_3_mean_tests() -> None:
         options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
     )
 
-    st.divider()
     st.markdown("### Replicación por grupo")
     rep_df = pd.DataFrame([{"grupo": k, "n": int(v)} for k, v in sorted(rep.items(), key=lambda kv: str(kv[0]))])
     st.dataframe(rep_df, use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.markdown("### Resultado inferencial (omnibus + posthoc si aplica)")
+    st.markdown("### Resultado inferencial")
     st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
     if warnings:
