@@ -49,6 +49,9 @@ def init_state() -> None:
     st.session_state.setdefault("analysis_variable_label", None)
     st.session_state.setdefault("analysis_source", None)  # "raw" | "kpi"
 
+    # NUEVO: factor de agrupación (columna categórica)
+    st.session_state.setdefault("group_factor", "treatment")
+
 
 def get_state() -> AppState:
     return st.session_state["pcta_state"]
@@ -71,9 +74,6 @@ def set_state(**kwargs) -> None:
 
 
 def _inject_table_css() -> None:
-    """
-    CSS suave para mejorar apariencia de st.dataframe sin depender de pandas Styler.
-    """
     st.markdown(
         """
         <style>
@@ -109,6 +109,29 @@ def numeric_cols(df: pd.DataFrame, *, exclude: Optional[set[str]] = None) -> Lis
             continue
         if pd.api.types.is_numeric_dtype(df[c]):
             out.append(c)
+    return out
+
+
+def _categorical_candidates(df: pd.DataFrame) -> List[str]:
+    """
+    Heurística para columnas que sirven como factor:
+    - object/string/bool/category
+    (excluye columnas típicamente numéricas aunque tengan pocos niveles)
+    """
+    out: List[str] = []
+    for c in df.columns:
+        if c in {"trial_id"}:
+            continue
+        s = df[c]
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            out.append(c)
+        elif pd.api.types.is_bool_dtype(s):
+            out.append(c)
+        elif pd.api.types.is_categorical_dtype(s):
+            out.append(c)
+    # prefer treatment si existe
+    if "treatment" in df.columns and "treatment" not in out:
+        out.insert(0, "treatment")
     return out
 
 
@@ -163,7 +186,7 @@ def _format_desc_table(desc: pd.DataFrame, *, group_col: str, decimals: int) -> 
             out[c] = out[c].apply(lambda v: "" if pd.isna(v) else f"{float(v):,.{decimals}f}")
 
     rename = {
-        group_col: "Tratamiento",
+        group_col: "Grupo",
         "n": "n",
         "media": "Media",
         "sd": "SD",
@@ -208,16 +231,11 @@ def _homogeneity_tests(df: pd.DataFrame, group_col: str, metric: str) -> Dict[st
 
     notes = []
     notes.append("Levene (mediana) evalúa homogeneidad de varianzas (p>0.05 sugiere varianzas similares).")
-    notes.append("Shapiro (p>0.05) sugiere normalidad; se reporta el p mínimo entre tratamientos (si n>=3).")
+    notes.append("Shapiro (p>0.05) sugiere normalidad; se reporta el p mínimo entre grupos (si n>=3).")
     return {"levene_p": levene_p, "shapiro_min_p": shapiro_min_p, "notes": " ".join(notes)}
 
 
 def _correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, object]:
-    """
-    Correlación entre 2 variables:
-    - method: "pearson" | "spearman"
-    - devuelve r, r2, p_value, n
-    """
     df = pd.DataFrame({"x": x, "y": y}).dropna()
     n = int(len(df))
     if n < 3:
@@ -372,11 +390,11 @@ def run_analysis(*, alpha: float, enable_posthoc: bool, wg_negative_is_error: bo
         )
 
 
-# ------------------------ TAB 1: Elegir variable + correr ------------------------
+# ------------------------ TAB 1: Elegir variable + correr + factor ------------------------
 
 
 def tab_1_select_variable_and_run() -> None:
-    st.subheader("1) Selección de variable + correr análisis")
+    st.subheader("1) Selección de variable + factor + correr análisis")
 
     state = get_state()
     if state.parsed is None:
@@ -388,7 +406,7 @@ def tab_1_select_variable_and_run() -> None:
     st.markdown("### Selecciona variable de trabajo (desde HOUSE_SUMMARY)")
     st.caption("Esta selección funciona ANTES de correr el análisis (input crudo).")
 
-    raw_exclude = {"trial_id", "unit_id", "treatment", "unit_type"}
+    raw_exclude = {"trial_id", "unit_id", "unit_type"}
     raw_numeric = numeric_cols(hs, exclude=raw_exclude)
 
     if not raw_numeric:
@@ -416,6 +434,28 @@ def tab_1_select_variable_and_run() -> None:
     st.session_state["analysis_source"] = "raw"
 
     st.success(f"Variable seleccionada: {st.session_state['analysis_variable_label']}")
+
+    st.divider()
+    st.markdown("### Factor de comparación (agrupación)")
+
+    candidates = _categorical_candidates(hs)
+    if not candidates:
+        st.warning("No encontré columnas categóricas. Se intentará usar 'treatment' si existe.")
+        st.session_state["group_factor"] = "treatment"
+    else:
+        default_factor = st.session_state.get("group_factor", "treatment")
+        if default_factor not in candidates:
+            default_factor = candidates[0]
+
+        factor = st.selectbox(
+            "Selecciona la columna de agrupación (factor)",
+            options=candidates,
+            index=candidates.index(default_factor),
+            key="group_factor_selectbox",
+        )
+        st.session_state["group_factor"] = factor
+        levels = int(hs[factor].astype(str).nunique(dropna=True))
+        st.caption(f"Niveles detectados en {factor}: {levels}")
 
     with st.expander("Vista previa de datos (opcional)", expanded=False):
         show = st.toggle("Mostrar tabla HOUSE_SUMMARY", value=False, key="preview_show_hs")
@@ -456,7 +496,7 @@ def tab_1_select_variable_and_run() -> None:
         st.success("Listo. Ve a la pestaña 2 para ver resultados.")
 
 
-# ------------------------ TAB 2: Resultados (MEJORADO + CORRELACIÓN) ------------------------
+# ------------------------ TAB 2: Resultados (factor flexible + correlación) ------------------------
 
 
 def tab_2_results_for_selected_variable() -> None:
@@ -477,31 +517,34 @@ def tab_2_results_for_selected_variable() -> None:
         return
 
     hs = state.parsed.to_dataframes()["house_summary"].copy()
-    if "treatment" not in hs.columns:
-        st.error("No existe columna 'treatment' en HOUSE_SUMMARY.")
+
+    group_col = st.session_state.get("group_factor", "treatment")
+    if group_col not in hs.columns:
+        st.error(f"No existe la columna de agrupación '{group_col}' en HOUSE_SUMMARY.")
         return
     if var not in hs.columns:
         st.error(f"La variable seleccionada ({var}) no existe en HOUSE_SUMMARY.")
         return
 
     n_units = int(len(hs))
-    treatments = sorted(hs["treatment"].astype(str).unique().tolist())
-    n_trt = int(len(treatments))
+    groups = sorted(hs[group_col].astype(str).dropna().unique().tolist())
+    n_groups = int(len(groups))
     missing = int(hs[var].isna().sum())
     valid = int(hs[var].notna().sum())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Variable", str(label))
     c2.metric("Unidades", str(n_units))
-    c3.metric("Tratamientos", str(n_trt))
+    c3.metric("Grupos", str(n_groups))
     c4.metric("Válidos", str(valid))
+    st.caption(f"Agrupando por: **{group_col}**")
 
     st.divider()
     st.markdown("### Datos de la variable seleccionada")
 
-    cols_show = [c for c in ["trial_id", "unit_id", "unit_type", "treatment"] if c in hs.columns] + [var]
+    cols_show = [c for c in ["trial_id", "unit_id", "unit_type", group_col] if c in hs.columns] + [var]
     data_view = hs[cols_show].copy()
-    sort_cols = [c for c in ["treatment", "unit_id"] if c in data_view.columns]
+    sort_cols = [c for c in [group_col, "unit_id"] if c in data_view.columns]
     if sort_cols:
         data_view = data_view.sort_values(sort_cols, kind="stable")
 
@@ -509,21 +552,16 @@ def tab_2_results_for_selected_variable() -> None:
         st.dataframe(data_view, use_container_width=True, hide_index=True)
 
     st.divider()
-    st.markdown("### Resumen descriptivo por tratamiento (mejorado)")
+    st.markdown("### Resumen descriptivo por grupo (mejorado)")
 
-    topL, topR = st.columns([1, 2])
-    with topL:
-        decimals = st.slider("Decimales", 0, 6, 2, key="tab2_desc_decimals")
-    with topR:
-        st.caption("Incluye: Media, SD, CV%, percentiles (P10/P25/P75/P90), rango.")
-
-    desc = describe_by_group(hs, "treatment", var)
-    desc_fmt = _format_desc_table(desc, group_col="treatment", decimals=decimals)
+    decimals = st.slider("Decimales", 0, 6, 2, key="tab2_desc_decimals")
+    desc = describe_by_group(hs, group_col, var)
+    desc_fmt = _format_desc_table(desc, group_col=group_col, decimals=decimals)
     st.dataframe(desc_fmt, use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Supuestos (informativo)")
-    tests = _homogeneity_tests(hs, "treatment", var)
+    tests = _homogeneity_tests(hs, group_col, var)
     a, b, c = st.columns(3)
     a.metric("Levene p (varianzas)", "—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}")
     b.metric("Shapiro min p", "—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}")
@@ -541,7 +579,7 @@ def tab_2_results_for_selected_variable() -> None:
 
     chart_type = st.radio(
         "Tipo de gráfico",
-        options=["Box (con puntos)", "Violín", "Barras (media)", "Dispersión (todas las unidades)"],
+        options=["Box (con puntos)", "Violín", "Barras (media)", "Dispersión"],
         horizontal=True,
         key="tab2_chart_type",
     )
@@ -549,20 +587,20 @@ def tab_2_results_for_selected_variable() -> None:
     col1, col2 = st.columns(2)
     with col1:
         if chart_type == "Box (con puntos)":
-            fig1 = px.box(hs, x="treatment", y=var, points="all", template="simple_white", title=f"{label} — distribución")
+            fig1 = px.box(hs, x=group_col, y=var, points="all", template="simple_white", title=f"{label} — distribución")
         elif chart_type == "Violín":
-            fig1 = px.violin(hs, x="treatment", y=var, box=True, points="all", template="simple_white", title=f"{label} — distribución")
+            fig1 = px.violin(hs, x=group_col, y=var, box=True, points="all", template="simple_white", title=f"{label} — distribución")
         elif chart_type == "Barras (media)":
-            means = hs.groupby("treatment", as_index=False)[var].mean(numeric_only=True)
-            fig1 = px.bar(means, x="treatment", y=var, template="simple_white", title=f"{label} — media")
+            means = hs.groupby(group_col, as_index=False)[var].mean(numeric_only=True)
+            fig1 = px.bar(means, x=group_col, y=var, template="simple_white", title=f"{label} — media")
         else:
-            fig1 = px.scatter(hs, x="treatment", y=var, template="simple_white", title=f"{label} — dispersión por tratamiento")
+            fig1 = px.scatter(hs, x=group_col, y=var, template="simple_white", title=f"{label} — dispersión por grupo")
         st.plotly_chart(fig1, use_container_width=True)
 
     with col2:
-        agg = hs.groupby("treatment", as_index=False)[var].agg(["mean", "std", "count"]).reset_index()
+        agg = hs.groupby(group_col, as_index=False)[var].agg(["mean", "std", "count"]).reset_index()
         agg = agg.rename(columns={"mean": "media", "std": "sd", "count": "n"})
-        fig2 = px.bar(agg, x="treatment", y="media", error_y="sd", template="simple_white", title=f"{label} — media ± SD")
+        fig2 = px.bar(agg, x=group_col, y="media", error_y="sd", template="simple_white", title=f"{label} — media ± SD")
         st.plotly_chart(fig2, use_container_width=True)
 
     st.divider()
@@ -575,22 +613,22 @@ def tab_2_results_for_selected_variable() -> None:
 
     scope = st.radio(
         "Alcance de la correlación",
-        options=["Toda la población", "Filtrar por tratamientos"],
+        options=["Toda la población", f"Filtrar por {group_col}"],
         horizontal=True,
         key="corr_scope",
     )
 
-    if scope == "Filtrar por tratamientos":
-        selected_trts = st.multiselect(
-            "Tratamientos incluidos",
-            options=treatments,
-            default=treatments,
-            key="corr_trts",
+    if scope != "Toda la población":
+        selected_levels = st.multiselect(
+            f"Niveles incluidos de {group_col}",
+            options=groups,
+            default=groups,
+            key="corr_levels",
         )
-        if len(selected_trts) == 0:
-            st.warning("Selecciona al menos un tratamiento.")
+        if len(selected_levels) == 0:
+            st.warning("Selecciona al menos un nivel.")
             return
-        df_corr_base = hs[hs["treatment"].astype(str).isin(set(selected_trts))].copy()
+        df_corr_base = hs[hs[group_col].astype(str).isin(set(selected_levels))].copy()
     else:
         df_corr_base = hs
 
@@ -618,9 +656,8 @@ def tab_2_results_for_selected_variable() -> None:
     if corr.get("note"):
         st.caption(str(corr["note"]))
 
-    df_plot = df_corr_base[[x_var, y_var, "treatment"]].dropna()
+    df_plot = df_corr_base[[x_var, y_var, group_col]].dropna()
 
-    # IMPORTANTE: si es población total, NO separar por treatment
     if scope == "Toda la población":
         figc = px.scatter(
             df_plot,
@@ -635,16 +672,16 @@ def tab_2_results_for_selected_variable() -> None:
             df_plot,
             x=x_var,
             y=y_var,
-            color="treatment",
+            color=group_col,
             trendline="ols" if method == "pearson" else None,
             template="simple_white",
-            title=f"Correlación ({method}) — por tratamiento: {x_var} vs {y_var}",
+            title=f"Correlación ({method}) — por {group_col}: {x_var} vs {y_var}",
         )
 
     st.plotly_chart(figc, use_container_width=True)
 
 
-# ------------------------ TAB 3: Test de medias ------------------------
+# ------------------------ TAB 3: Test de medias (pendiente factor flexible en core) ------------------------
 
 
 def tab_3_mean_tests() -> None:
@@ -665,8 +702,7 @@ def tab_3_mean_tests() -> None:
     if var not in kpi_cols:
         st.warning(
             f"La variable seleccionada ({var}) es de input crudo y no está disponible como KPI calculado. "
-            "Para ANOVA/posthoc, selecciona una variable KPI (ej: bw_final_mean_g, fcr, wg_g_per_bird) "
-            "o ampliamos el core para inferencia sobre raw."
+            "Para ANOVA/posthoc, selecciona una variable KPI (ej: bw_final_mean_g, fcr, wg_g_per_bird)."
         )
         return
 
