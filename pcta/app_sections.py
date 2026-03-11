@@ -17,7 +17,9 @@ from pcta.core.schemas import AnalysisWarning, ParsedInput
 from pcta.core.stats import StatsOptions, run_inferential_statistics_df
 
 
-# ------------------------ Estado ------------------------
+# ======================================================================================
+# State
+# ======================================================================================
 
 
 @dataclass(frozen=True)
@@ -30,31 +32,35 @@ def init_state() -> None:
     if "pcta_state" not in st.session_state:
         st.session_state["pcta_state"] = AppState(parsed=None, warnings=[])
 
-    # Modo libre
+    # Free mode
     st.session_state.setdefault("raw_mode", False)
     st.session_state.setdefault("raw_df", None)  # pd.DataFrame | None
     st.session_state.setdefault("raw_sheet_name", None)
 
-    # Selecciones de análisis (diseño)
+    # Design selections
     st.session_state.setdefault("dv_col", None)
     st.session_state.setdefault("factor_a", None)
     st.session_state.setdefault("factor_b", None)
     st.session_state.setdefault("block_col", None)
     st.session_state.setdefault("filters", {})
 
-    # Correlación (módulo independiente)
+    # Correlation module (independent)
     st.session_state.setdefault("corr_x_var", None)
     st.session_state.setdefault("corr_y_var", None)
     st.session_state.setdefault("corr_method", "pearson")
     st.session_state.setdefault("corr_mode", "global")  # global | by_group | compare_full_post
     st.session_state.setdefault("corr_group_col", None)
     st.session_state.setdefault("corr_scope", "post_filter")  # post_filter | full
-    st.session_state.setdefault("corr_global_color_by", None)  # None | <cat col>
+    st.session_state.setdefault("corr_global_color_by", None)
     st.session_state.setdefault("corr_show_group_trendlines", True)
 
-    # Plots (distribuciones)
+    # Distribution plots
     st.session_state.setdefault("show_violin", True)
     st.session_state.setdefault("show_points", True)
+
+    # Tab 3 (mean tests) UI
+    st.session_state.setdefault("tab3_posthoc_policy", "auto_if_significant")  # auto_if_significant | always | never
+    st.session_state.setdefault("tab3_posthoc_method", "auto")  # auto | tukey_hsd | games_howell_approx_holm | dunn_approx_mannwhitney_holm
 
 
 def get_state() -> AppState:
@@ -65,7 +71,9 @@ def set_state(*, parsed: Optional[ParsedInput], warnings: List[AnalysisWarning])
     st.session_state["pcta_state"] = AppState(parsed=parsed, warnings=warnings)
 
 
-# ------------------------ Helpers ------------------------
+# ======================================================================================
+# Helpers
+# ======================================================================================
 
 
 def _inject_table_css() -> None:
@@ -126,6 +134,11 @@ def _read_excel_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
 
 
 def get_active_df() -> Optional[pd.DataFrame]:
+    """
+    Active dataset for flexible analysis:
+      - Free mode: raw_df
+      - Strict mode: parsed.house_summary (or first dataframe if missing)
+    """
     if st.session_state.get("raw_mode") and isinstance(st.session_state.get("raw_df"), pd.DataFrame):
         return st.session_state["raw_df"]
 
@@ -147,10 +160,10 @@ def render_design_controls(
     cat = categorical_cols(df)
 
     if not num:
-        st.error("No hay columnas numéricas para Y.")
+        st.error("No hay columnas numéricas disponibles para Y.")
         return "", "", None, None, {}
     if not cat:
-        st.error("No hay columnas categóricas para factores/filtros.")
+        st.error("No hay columnas categóricas disponibles para factores/filtros.")
         return "", "", None, None, {}
 
     dv_default = st.session_state.get("dv_col")
@@ -162,10 +175,7 @@ def render_design_controls(
         fa_default = cat[0]
 
     dv_col = st.selectbox("Variable dependiente (Y)", options=num, index=num.index(dv_default), key=f"{prefix_key}_dv")
-    st.session_state["dv_col"] = dv_col
-
     factor_a = st.selectbox("Factor A (principal)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa")
-    st.session_state["factor_a"] = factor_a
 
     b_opts = [None] + [c for c in cat if c != factor_a]
     fb_default = st.session_state.get("factor_b")
@@ -178,7 +188,6 @@ def render_design_controls(
         index=b_opts.index(fb_default),
         key=f"{prefix_key}_fb",
     )
-    st.session_state["factor_b"] = factor_b
 
     block_opts = [None] + [c for c in cat if c not in {factor_a, factor_b}]
     block_default = st.session_state.get("block_col")
@@ -191,7 +200,6 @@ def render_design_controls(
         index=block_opts.index(block_default),
         key=f"{prefix_key}_block",
     )
-    st.session_state["block_col"] = block_col
 
     st.markdown("#### Bloqueos / filtros (pre-análisis)")
     filter_cols = st.multiselect("Columnas a filtrar", options=cat, default=[], key=f"{prefix_key}_filter_cols")
@@ -205,6 +213,12 @@ def render_design_controls(
             key=f"{prefix_key}_filter_levels_{col}",
         )
         filters[col] = chosen
+
+    # persist
+    st.session_state["dv_col"] = dv_col
+    st.session_state["factor_a"] = factor_a
+    st.session_state["factor_b"] = factor_b
+    st.session_state["block_col"] = block_col
     st.session_state["filters"] = filters
 
     return dv_col, factor_a, factor_b, block_col, filters
@@ -219,55 +233,21 @@ def describe_by_group(df: pd.DataFrame, group_cols: List[str], metric: str) -> p
         sub.groupby(group_cols)[metric]
         .agg(
             n="count",
-            media="mean",
+            mean="mean",
             sd=lambda s: float(s.std(ddof=1)),
             min="min",
             p10=lambda s: float(s.quantile(0.10)),
             p25=lambda s: float(s.quantile(0.25)),
-            mediana="median",
+            median="median",
             p75=lambda s: float(s.quantile(0.75)),
             p90=lambda s: float(s.quantile(0.90)),
             max="max",
         )
         .reset_index()
     )
-    g["rango"] = g["max"] - g["min"]
-    g["cv_pct"] = g.apply(lambda r: (np.nan if r["media"] == 0 else 100.0 * r["sd"] / abs(r["media"])), axis=1)
+    g["range"] = g["max"] - g["min"]
+    g["cv_pct"] = g.apply(lambda r: (np.nan if r["mean"] == 0 else 100.0 * r["sd"] / abs(r["mean"])), axis=1)
     return g
-
-
-def format_desc_table(desc: pd.DataFrame, *, group_cols: List[str], decimals: int) -> pd.DataFrame:
-    if desc.empty:
-        return desc
-
-    out = desc.copy()
-    out["n"] = out["n"].fillna(0).astype(int)
-
-    num_cols = [c for c in out.columns if c not in set(group_cols + ["n"])]
-    for c in num_cols:
-        if c == "cv_pct":
-            out[c] = out[c].apply(lambda v: "" if pd.isna(v) else f"{float(v):.{min(2,decimals)}f}%")
-        else:
-            out[c] = out[c].apply(lambda v: "" if pd.isna(v) else f"{float(v):,.{decimals}f}")
-
-    rename = {gc: f"Factor_{i+1}" for i, gc in enumerate(group_cols)}
-    rename.update(
-        {
-            "n": "n",
-            "media": "Media",
-            "sd": "SD",
-            "cv_pct": "CV%",
-            "min": "Mín",
-            "p10": "P10",
-            "p25": "P25",
-            "mediana": "Mediana",
-            "p75": "P75",
-            "p90": "P90",
-            "max": "Máx",
-            "rango": "Rango",
-        }
-    )
-    return out.rename(columns=rename)
 
 
 def homogeneity_tests(df: pd.DataFrame, group_col: str, metric: str) -> Dict[str, object]:
@@ -308,28 +288,68 @@ def correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, obje
     else:
         r, p = sps.spearmanr(df["x"].to_numpy(float), df["y"].to_numpy(float))
 
-    return {"n": n, "r": float(r), "r2": float(r * r), "p_value": float(p)}
+    r = float(r)
+    p = float(p)
+    return {"n": n, "r": r, "r2": float(r * r), "p_value": p}
+
+
+def _fmt_p(p: object) -> str:
+    if p is None:
+        return "—"
+    try:
+        pf = float(p)
+        if np.isnan(pf):
+            return "—"
+        return "<0.0001" if pf < 1e-4 else f"{pf:.4g}"
+    except Exception:
+        return "—"
+
+
+def _fmt_num(x: object, digits: int = 4) -> str:
+    if x is None:
+        return "—"
+    try:
+        xf = float(x)
+        if np.isnan(xf):
+            return "—"
+        return f"{xf:.{digits}f}"
+    except Exception:
+        return "—"
 
 
 def _sanitize_corr_xy(cols_num: List[str]) -> Tuple[str, str]:
-    """
-    Ensures corr_x_var/corr_y_var are valid options and distinct.
-    """
     cur_x = st.session_state.get("corr_x_var")
     cur_y = st.session_state.get("corr_y_var")
-
     if cur_x not in cols_num:
         st.session_state["corr_x_var"] = cols_num[0]
         cur_x = cols_num[0]
-
     if cur_y not in cols_num or cur_y == cur_x:
         st.session_state["corr_y_var"] = next((c for c in cols_num if c != cur_x), cur_x)
         cur_y = st.session_state["corr_y_var"]
-
     return str(cur_x), str(cur_y)
 
 
-# ------------------------ Sidebar ------------------------
+def _posthoc_to_df(posthoc_obj: object) -> pd.DataFrame:
+    """
+    Expects `posthoc` column from stats module which is typically:
+      {"method": "...", "comparisons": [ {...}, {...} ] }
+    """
+    if not isinstance(posthoc_obj, dict):
+        return pd.DataFrame()
+    comps = posthoc_obj.get("comparisons")
+    if not isinstance(comps, list):
+        return pd.DataFrame()
+    df = pd.DataFrame(comps)
+    # friendly formatting if present
+    for c in ["p_adj", "p_raw", "p_value"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_fmt_p)
+    return df
+
+
+# ======================================================================================
+# Sidebar + load (strict -> free)
+# ======================================================================================
 
 
 @dataclass(frozen=True)
@@ -357,8 +377,8 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
         )
 
         logout_button()
-
         st.divider()
+
         st.subheader("Carga de archivos")
         uploaded_main = st.file_uploader(
             "Ensayo (Excel .xlsx o CSV .csv)",
@@ -368,9 +388,6 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
         )
 
     return SidebarResult(uploaded_main=uploaded_main)
-
-
-# ------------------------ Carga (estricto o libre) ------------------------
 
 
 def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
@@ -414,20 +431,19 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
     st.error("Formato no soportado. Sube un .xlsx o .csv.")
 
 
-# ------------------------ Tabs ------------------------
+# ======================================================================================
+# TAB 1/2/3/Export
+# ======================================================================================
 
 
 def tab_1_select_variable_and_run() -> None:
     st.subheader("1) Definir diseño (Y/A/B/bloque/filtros)")
-
     df = get_active_df()
     if df is None:
         st.info("Carga un archivo en la barra lateral para comenzar.")
         return
-
     if st.session_state.get("raw_mode"):
         st.caption("Modo Libre activado: puedes elegir columnas con cualquier nombre.")
-
     render_design_controls(df, prefix_key="tab1")
 
 
@@ -443,7 +459,6 @@ def tab_2_results_for_selected_variable() -> None:
     st.markdown("### A) Diseño (para descriptivo / distribuciones)")
     dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2_design")
     df_post = apply_filters(df, filters)
-
     if df_post.empty:
         st.error("Con los filtros actuales no quedan filas.")
         return
@@ -452,10 +467,10 @@ def tab_2_results_for_selected_variable() -> None:
 
     st.divider()
     st.markdown("### B) Resumen descriptivo")
-    decimals = st.slider("Decimales", 0, 6, 2, key="tab2_decimals")
     desc = describe_by_group(df_post, group_cols, dv_col)
-    st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
+    st.dataframe(desc, use_container_width=True, hide_index=True)
 
+    # distributions
     try:
         import plotly.express as px
     except Exception:
@@ -469,7 +484,6 @@ def tab_2_results_for_selected_variable() -> None:
 
     show_violin = st.checkbox("Ver violin plot", value=True, key="show_violin")
     show_points = st.checkbox("Mostrar puntos (strip)", value=True, key="show_points")
-
     if factor_b:
         fig_dist = (
             px.violin(df_post, x=factor_a, y=dv_col, color=factor_b, box=True, points="all" if show_points else False, template="simple_white")
@@ -484,7 +498,7 @@ def tab_2_results_for_selected_variable() -> None:
         )
     st.plotly_chart(fig_dist, use_container_width=True)
 
-    # ---------------- Correlación ----------------
+    # correlation module
     st.divider()
     st.markdown("### D) Correlación (módulo independiente)")
 
@@ -503,7 +517,6 @@ def tab_2_results_for_selected_variable() -> None:
 
     method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
 
-    # Compare FULL vs POST in one plot
     if corr_mode == "compare_full_post":
         num_full = set(numeric_cols(df))
         num_post = set(numeric_cols(df_post))
@@ -513,7 +526,6 @@ def tab_2_results_for_selected_variable() -> None:
             return
 
         x0, y0 = _sanitize_corr_xy(cols_num)
-
         c1, c2 = st.columns(2)
         with c1:
             x_var = st.selectbox("Variable X", options=cols_num, index=cols_num.index(x0), key="corr_x_var")
@@ -528,15 +540,15 @@ def tab_2_results_for_selected_variable() -> None:
         st.markdown("#### Estadísticos (dos poblaciones)")
         a1, a2, a3, a4 = st.columns(4)
         a1.metric("n FULL", str(c_full["n"]))
-        a2.metric("r FULL", "—" if c_full["r"] is None else f"{c_full['r']:.4f}")
-        a3.metric("r² FULL", "—" if c_full["r2"] is None else f"{c_full['r2']:.4f}")
-        a4.metric("p FULL", "—" if c_full["p_value"] is None else f"{c_full['p_value']:.4g}")
+        a2.metric("r FULL", _fmt_num(c_full["r"]))
+        a3.metric("r² FULL", _fmt_num(c_full["r2"]))
+        a4.metric("p FULL", _fmt_p(c_full["p_value"]))
 
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("n POST", str(c_post["n"]))
-        b2.metric("r POST", "—" if c_post["r"] is None else f"{c_post['r']:.4f}")
-        b3.metric("r² POST", "—" if c_post["r2"] is None else f"{c_post['r2']:.4f}")
-        b4.metric("p POST", "—" if c_post["p_value"] is None else f"{c_post['p_value']:.4g}")
+        b2.metric("r POST", _fmt_num(c_post["r"]))
+        b3.metric("r² POST", _fmt_num(c_post["r2"]))
+        b4.metric("p POST", _fmt_p(c_post["p_value"]))
 
         df_full_plot = df[[x_var, y_var]].dropna().copy()
         df_full_plot["_poblacion"] = "FULL"
@@ -556,7 +568,6 @@ def tab_2_results_for_selected_variable() -> None:
         st.plotly_chart(fig, use_container_width=True)
         return
 
-    # global / by_group use a chosen scope
     corr_scope = st.radio(
         "Dataset base para correlación",
         options=["post_filter", "full"],
@@ -573,7 +584,6 @@ def tab_2_results_for_selected_variable() -> None:
         return
 
     x0, y0 = _sanitize_corr_xy(cols_num)
-
     c1, c2 = st.columns(2)
     with c1:
         x_var = st.selectbox("Variable X", options=cols_num, index=cols_num.index(x0), key="corr_x_var")
@@ -583,17 +593,16 @@ def tab_2_results_for_selected_variable() -> None:
         y_var = st.selectbox("Variable Y", options=cols_num, index=cols_num.index(st.session_state["corr_y_var"]), key="corr_y_var")
 
     if corr_mode == "global":
-        # Option to color by a factor, but clarify that stats are global
         cat_cols = categorical_cols(corr_df)
         color_opts = [None] + cat_cols
-        color_default = st.session_state.get("corr_global_color_by")
-        if color_default not in color_opts:
-            color_default = None
+        default_color = st.session_state.get("corr_global_color_by")
+        if default_color not in color_opts:
+            default_color = None
 
         color_by = st.selectbox(
             "Color (solo visual en modo Global)",
             options=color_opts,
-            index=color_opts.index(color_default),
+            index=color_opts.index(default_color),
             format_func=lambda v: "— Sin color —" if v is None else str(v),
             key="corr_global_color_by",
         )
@@ -601,9 +610,9 @@ def tab_2_results_for_selected_variable() -> None:
         c = correlation_stats(corr_df[x_var], corr_df[y_var], method=method)
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("n", str(c["n"]))
-        k2.metric("r", "—" if c["r"] is None else f"{c['r']:.4f}")
-        k3.metric("r²", "—" if c["r2"] is None else f"{c['r2']:.4f}")
-        k4.metric("p-value", "—" if c["p_value"] is None else f"{c['p_value']:.4g}")
+        k2.metric("r", _fmt_num(c["r"]))
+        k3.metric("r²", _fmt_num(c["r2"]))
+        k4.metric("p-value", _fmt_p(c["p_value"]))
 
         if color_by is not None:
             st.caption("Nota: el color representa subgrupos, pero los estadísticos mostrados arriba son GLOBAL (una sola población).")
@@ -630,7 +639,7 @@ def tab_2_results_for_selected_variable() -> None:
         st.plotly_chart(fig, use_container_width=True)
         return
 
-    # by_group: must show per-group statistics table
+    # by_group
     cat_cols = categorical_cols(corr_df)
     if not cat_cols:
         st.warning("No hay columnas categóricas para calcular correlación por factor.")
@@ -681,6 +690,7 @@ def tab_2_results_for_selected_variable() -> None:
 
 def tab_3_mean_tests() -> None:
     st.subheader("3) Test de medias (inferencial)")
+
     df = get_active_df()
     if df is None:
         st.info("Carga un archivo primero.")
@@ -692,9 +702,12 @@ def tab_3_mean_tests() -> None:
         st.error("Con los filtros actuales no quedan filas.")
         return
 
-    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="alpha_tab3")
+    st.divider()
+    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="tab3_alpha")
 
+    # Factorial A×B
     if factor_b:
+        st.markdown("### ANOVA factorial (A×B)")
         include_interaction = st.checkbox("Incluir interacción A:B", value=True, key="tab3_interaction")
         anova_type = st.selectbox("Tipo de ANOVA", options=[2, 3], index=0, key="tab3_anova_type")
         use_block = st.checkbox("Incluir bloque como efecto fijo", value=bool(block_col), key="tab3_use_block")
@@ -710,16 +723,101 @@ def tab_3_mean_tests() -> None:
         st.caption(f"Fórmula: `{meta.get('formula','')}`")
         st.caption(f"min n por celda (A×B): {meta.get('min_n_per_cell')}")
         st.dataframe(aov_df, use_container_width=True, hide_index=True)
+        st.info("Posthoc factorial: siguiente iteración (si lo necesitas).")
         return
 
-    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_posthoc")
-    stats_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
+    # 1-factor: omnibus first (no posthoc)
+    st.markdown("### Omnibus (selección automática del test)")
+    omni_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
         df_f,
         metric=dv_col,
         group_col=factor_a,
-        options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
+        options=StatsOptions(alpha=float(alpha), enable_posthoc=False),
     )
-    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    if omni_df.empty:
+        st.warning("No se pudo calcular el omnibus.")
+        return
+
+    row = omni_df.iloc[0].to_dict()
+    p_val = row.get("p_value")
+    test_name = str(row.get("test"))
+
+    # Summary cards
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Test", test_name)
+    c2.metric("p-value", _fmt_p(p_val))
+    c3.metric("Shapiro (min p)", _fmt_p(row.get("assumptions_shapiro_min_p")))
+    c4.metric("Levene p", _fmt_p(row.get("assumptions_levene_p")))
+    c5.metric("Effect size", _fmt_num(row.get("effect_size"), digits=4))
+
+    st.markdown("#### Tabla omnibus (completa)")
+    st.dataframe(pd.DataFrame([row]), use_container_width=True, hide_index=True)
+
+    with st.expander("Replicación por grupo", expanded=False):
+        rep_df = pd.DataFrame([{"grupo": k, "n": int(v)} for k, v in sorted(rep.items(), key=lambda kv: str(kv[0]))])
+        st.dataframe(rep_df, use_container_width=True, hide_index=True)
+
+    if warnings:
+        with st.expander("Advertencias", expanded=False):
+            st.dataframe(
+                pd.DataFrame([{"code": w.code.value, "message": w.message, "context": w.context} for w in warnings]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if not enabled:
+        st.warning("Inferencia deshabilitada: se requiere al menos n>=2 por grupo para p-values.")
+        return
+
+    st.divider()
+    st.markdown("### Posthoc (test de medias)")
+
+    # decide if significant
+    sig = False
+    try:
+        if p_val is not None and not (isinstance(p_val, float) and np.isnan(float(p_val))):
+            sig = float(p_val) <= float(alpha)
+    except Exception:
+        sig = False
+
+    policy = st.radio(
+        "¿Cuándo correr posthoc?",
+        options=["auto_if_significant", "always", "never"],
+        index=["auto_if_significant", "always", "never"].index(st.session_state.get("tab3_posthoc_policy", "auto_if_significant")),
+        format_func=lambda v: {"auto_if_significant": "Solo si omnibus es significativo", "always": "Siempre", "never": "Nunca"}[v],
+        key="tab3_posthoc_policy",
+        horizontal=True,
+    )
+
+    can_run = (policy == "always") or (policy == "auto_if_significant" and sig)
+    if policy == "auto_if_significant" and not sig:
+        st.info("Omnibus no significativo: posthoc omitido. Cambia a 'Siempre' si deseas explorarlo.")
+        return
+    if policy == "never":
+        return
+
+    # Run again with posthoc enabled (automatic selection inside stats.py)
+    # This fulfills: "si sale significativo elegir el test de medias" because
+    # we trigger posthoc only when significant (default) and let stats choose.
+    full_df, *_ = run_inferential_statistics_df(
+        df_f,
+        metric=dv_col,
+        group_col=factor_a,
+        options=StatsOptions(alpha=float(alpha), enable_posthoc=True),
+    )
+    if full_df.empty:
+        st.warning("No se pudo calcular posthoc.")
+        return
+
+    posthoc_obj = full_df.loc[0, "posthoc"] if "posthoc" in full_df.columns else None
+    ph_df = _posthoc_to_df(posthoc_obj)
+    if ph_df.empty:
+        st.warning("No hay comparaciones posthoc disponibles.")
+        return
+
+    # Big readable table
+    st.markdown("#### Comparaciones pareadas (posthoc)")
+    st.dataframe(ph_df, use_container_width=True, hide_index=True)
 
 
 def tab_export() -> None:
