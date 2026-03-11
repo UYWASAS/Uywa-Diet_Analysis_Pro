@@ -43,14 +43,15 @@ def init_state() -> None:
     st.session_state.setdefault("filters", {})
 
     # Correlación (módulo independiente)
-    st.session_state.setdefault("corr_scope", "post_filter")  # widget key: corr_scope
-    st.session_state.setdefault("corr_x_var", None)  # widget key: corr_x_var
-    st.session_state.setdefault("corr_y_var", None)  # widget key: corr_y_var
-    st.session_state.setdefault("corr_method", "pearson")  # widget key: corr_method
-    st.session_state.setdefault("corr_keep_x_fixed", True)  # widget key: corr_keep_x_fixed
-    st.session_state.setdefault("corr_sync_y_with_dv", False)  # widget key: corr_sync_y_with_dv
+    st.session_state.setdefault("corr_x_var", None)
+    st.session_state.setdefault("corr_y_var", None)
+    st.session_state.setdefault("corr_method", "pearson")
+    st.session_state.setdefault("corr_mode", "global")  # global | by_group | compare_full_post
+    st.session_state.setdefault("corr_group_col", None)
+    st.session_state.setdefault("corr_color_factor_a", False)
+    st.session_state.setdefault("corr_compare_overlay", True)  # single plot overlay
 
-    # Plots
+    # Plots (distribuciones)
     st.session_state.setdefault("show_violin", True)
     st.session_state.setdefault("show_points", True)
 
@@ -160,7 +161,7 @@ def render_design_controls(
         fa_default = cat[0]
 
     dv_col = st.selectbox("Variable dependiente (Y)", options=num, index=num.index(dv_default), key=f"{prefix_key}_dv")
-    st.session_state["dv_col"] = dv_col  # OK: NO es key de widget global; es nuestra app key
+    st.session_state["dv_col"] = dv_col
 
     factor_a = st.selectbox("Factor A (principal)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa")
     st.session_state["factor_a"] = factor_a
@@ -250,7 +251,20 @@ def format_desc_table(desc: pd.DataFrame, *, group_cols: List[str], decimals: in
 
     rename = {gc: f"Factor_{i+1}" for i, gc in enumerate(group_cols)}
     rename.update(
-        {"n": "n", "media": "Media", "sd": "SD", "cv_pct": "CV%", "min": "Mín", "p10": "P10", "p25": "P25", "mediana": "Mediana", "p75": "P75", "p90": "P90", "max": "Máx", "rango": "Rango"}
+        {
+            "n": "n",
+            "media": "Media",
+            "sd": "SD",
+            "cv_pct": "CV%",
+            "min": "Mín",
+            "p10": "P10",
+            "p25": "P25",
+            "mediana": "Mediana",
+            "p75": "P75",
+            "p90": "P90",
+            "max": "Máx",
+            "rango": "Rango",
+        }
     )
     return out.rename(columns=rename)
 
@@ -296,6 +310,30 @@ def correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, obje
     return {"n": n, "r": float(r), "r2": float(r * r), "p_value": float(p)}
 
 
+def _sanitize_corr_xy(corr_df: pd.DataFrame) -> Tuple[List[str], str, str]:
+    """
+    Returns (corr_num, x_var, y_var) always valid for corr_df.
+    Also updates st.session_state corr_x_var / corr_y_var when needed.
+    """
+    corr_num = numeric_cols(corr_df)
+    if len(corr_num) < 2:
+        return corr_num, "", ""
+
+    cur_x = st.session_state.get("corr_x_var")
+    cur_y = st.session_state.get("corr_y_var")
+
+    if cur_x not in corr_num:
+        st.session_state["corr_x_var"] = corr_num[0]
+        cur_x = corr_num[0]
+
+    if cur_y not in corr_num or cur_y == cur_x:
+        fallback_y = next((c for c in corr_num if c != cur_x), cur_x)
+        st.session_state["corr_y_var"] = fallback_y
+        cur_y = fallback_y
+
+    return corr_num, str(cur_x), str(cur_y)
+
+
 # ------------------------ Sidebar ------------------------
 
 
@@ -324,8 +362,8 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
         )
 
         logout_button()
-        st.divider()
 
+        st.divider()
         st.subheader("Carga de archivos")
         uploaded_main = st.file_uploader(
             "Ensayo (Excel .xlsx o CSV .csv)",
@@ -410,6 +448,7 @@ def tab_2_results_for_selected_variable() -> None:
     st.markdown("### A) Diseño (para descriptivo / distribuciones)")
     dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2_design")
     df_post = apply_filters(df, filters)
+
     if df_post.empty:
         st.error("Con los filtros actuales no quedan filas.")
         return
@@ -422,7 +461,6 @@ def tab_2_results_for_selected_variable() -> None:
     desc = describe_by_group(df_post, group_cols, dv_col)
     st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
 
-    # Plots + correlación independiente
     try:
         import plotly.express as px
     except Exception:
@@ -451,77 +489,205 @@ def tab_2_results_for_selected_variable() -> None:
         )
     st.plotly_chart(fig_dist, use_container_width=True)
 
+    # ---------------- Correlación (módulo independiente) ----------------
     st.divider()
     st.markdown("### D) Correlación (módulo independiente)")
 
+    # Modo de correlación
+    corr_mode = st.radio(
+        "Modo de correlación",
+        options=["global", "by_group", "compare_full_post"],
+        index=["global", "by_group", "compare_full_post"].index(st.session_state.get("corr_mode", "global")),
+        format_func=lambda v: {
+            "global": "Global (una población)",
+            "by_group": "Por grupo (r/p por nivel)",
+            "compare_full_post": "Comparar: completo vs post-filtro (mismo gráfico, colores y símbolos)",
+        }[v],
+        key="corr_mode",
+        horizontal=True,
+    )
+
+    # Base dataframe for selecting numeric columns and X/Y selectors:
+    # - for compare we need the intersection of numeric columns available in both
+    if corr_mode == "compare_full_post":
+        corr_full = df
+        corr_post = df_post
+
+        num_full = set(numeric_cols(corr_full))
+        num_post = set(numeric_cols(corr_post))
+        corr_num = sorted(num_full.intersection(num_post))
+        if len(corr_num) < 2:
+            st.info("Para comparar, se necesitan al menos 2 columnas numéricas presentes tanto en FULL como en POST-FILTRO.")
+            return
+
+        # sanitize against intersection list (not a DataFrame)
+        cur_x = st.session_state.get("corr_x_var")
+        cur_y = st.session_state.get("corr_y_var")
+        if cur_x not in corr_num:
+            st.session_state["corr_x_var"] = corr_num[0]
+            cur_x = corr_num[0]
+        if cur_y not in corr_num or cur_y == cur_x:
+            st.session_state["corr_y_var"] = (corr_num[1] if corr_num[1] != cur_x else corr_num[0])
+            cur_y = st.session_state["corr_y_var"]
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            x_var = st.selectbox("Variable X", options=corr_num, index=corr_num.index(cur_x), key="corr_x_var")
+        with c2:
+            if st.session_state.get("corr_y_var") == x_var:
+                st.session_state["corr_y_var"] = next((c for c in corr_num if c != x_var), x_var)
+            y_var = st.selectbox("Variable Y", options=corr_num, index=corr_num.index(st.session_state["corr_y_var"]), key="corr_y_var")
+        with c3:
+            method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
+
+        # Compute stats separately
+        c_full = correlation_stats(corr_full[x_var], corr_full[y_var], method=method)
+        c_post = correlation_stats(corr_post[x_var], corr_post[y_var], method=method)
+
+        st.markdown("#### Estadísticos (dos poblaciones)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("n FULL", str(c_full["n"]))
+        m2.metric("r FULL", "—" if c_full["r"] is None else f"{c_full['r']:.4f}")
+        m3.metric("p FULL", "—" if c_full["p_value"] is None else f"{c_full['p_value']:.4g}")
+        m4.metric("r² FULL", "—" if c_full["r2"] is None else f"{c_full['r2']:.4f}")
+
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("n POST", str(c_post["n"]))
+        n2.metric("r POST", "—" if c_post["r"] is None else f"{c_post['r']:.4f}")
+        n3.metric("p POST", "—" if c_post["p_value"] is None else f"{c_post['p_value']:.4g}")
+        n4.metric("r² POST", "—" if c_post["r2"] is None else f"{c_post['r2']:.4f}")
+
+        # Build overlay plot with color + symbol by population
+        df_full_plot = corr_full[[x_var, y_var]].dropna().copy()
+        df_full_plot["_poblacion"] = "FULL"
+        df_post_plot = corr_post[[x_var, y_var]].dropna().copy()
+        df_post_plot["_poblacion"] = "POST-FILTRO"
+
+        df_plot = pd.concat([df_full_plot, df_post_plot], ignore_index=True)
+
+        fig = px.scatter(
+            df_plot,
+            x=x_var,
+            y=y_var,
+            color="_poblacion",
+            symbol="_poblacion",
+            template="simple_white",
+            title=f"Comparación en un solo plano: {x_var} vs {y_var} (FULL vs POST-FILTRO)",
+        )
+        # Trendline: Plotly trendline doesn't support separate fits per symbol cleanly here.
+        # Keep it off to avoid confusion; we can add two regression lines later via statsmodels.
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    # global / by_group operate on chosen scope
     corr_scope = st.radio(
         "Dataset base para correlación",
         options=["post_filter", "full"],
-        index=0 if st.session_state.get("corr_scope") == "post_filter" else 1,
+        index=0,
         format_func=lambda v: "Usar datos post-filtro" if v == "post_filter" else "Usar datos completos (sin filtros)",
         key="corr_scope",
         horizontal=True,
     )
-    corr_df = df_post if corr_scope == "post_filter" else df
+    corr_df_base = df_post if corr_scope == "post_filter" else df
+    corr_cat = categorical_cols(corr_df_base)
+    corr_num, x0, y0 = _sanitize_corr_xy(corr_df_base)
 
-    corr_num = numeric_cols(corr_df)
     if len(corr_num) < 2:
         st.info("No hay suficientes variables numéricas para correlación.")
         return
 
-    sync_y = st.checkbox(
-        "Sincronizar Y de correlación con Y del diseño",
-        value=bool(st.session_state.get("corr_sync_y_with_dv", False)),
-        key="corr_sync_y_with_dv",
-    )
-    if sync_y and dv_col in corr_num:
-        current_y = st.session_state.get("corr_y_var")
-        if (current_y is None) or (current_y not in corr_num):
-            st.session_state["corr_y_var"] = dv_col
-
-    x_default = st.session_state.get("corr_x_var") or corr_num[0]
-    y_default = st.session_state.get("corr_y_var") or (corr_num[1] if len(corr_num) > 1 else corr_num[0])
-    if x_default not in corr_num:
-        x_default = corr_num[0]
-    if y_default not in corr_num:
-        y_default = corr_num[1] if len(corr_num) > 1 else corr_num[0]
-
-    st.checkbox("Mantener X fijo (solo cambiar Y)", value=bool(st.session_state.get("corr_keep_x_fixed", True)), key="corr_keep_x_fixed")
-
-    cL, cM, cR = st.columns([1, 1, 1])
-    with cL:
-        x_var = st.selectbox("Variable X (correlación)", options=corr_num, index=corr_num.index(x_default), key="corr_x_var")
-    with cM:
-        y_var = st.selectbox("Variable Y (correlación)", options=corr_num, index=corr_num.index(y_default), key="corr_y_var")
-    with cR:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        x_var = st.selectbox("Variable X", options=corr_num, index=corr_num.index(x0), key="corr_x_var")
+    with c2:
+        # Ensure Y != X
+        if st.session_state.get("corr_y_var") == x_var:
+            st.session_state["corr_y_var"] = next((c for c in corr_num if c != x_var), x_var)
+        y_var = st.selectbox("Variable Y", options=corr_num, index=corr_num.index(st.session_state["corr_y_var"]), key="corr_y_var")
+    with c3:
         method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
 
     if x_var == y_var:
         st.warning("Selecciona X ≠ Y.")
         return
 
-    corr = correlation_stats(corr_df[x_var], corr_df[y_var], method=method)
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("n", str(corr["n"]))
-    k2.metric("r", "—" if corr["r"] is None else f"{corr['r']:.4f}")
-    k3.metric("r²", "—" if corr["r2"] is None else f"{corr['r2']:.4f}")
-    k4.metric("p-value", "—" if corr["p_value"] is None else f"{corr['p_value']:.4g}")
+    if corr_mode == "global":
+        color_mode = st.checkbox(
+            "Colorear por Factor A (solo visual; stats siguen siendo globales)",
+            value=bool(st.session_state.get("corr_color_factor_a", False)),
+            key="corr_color_factor_a",
+        )
 
-    plot_cols = [x_var, y_var]
-    if factor_a in corr_df.columns:
-        plot_cols.append(factor_a)
-    df_plot = corr_df[plot_cols].dropna()
+        c = correlation_stats(corr_df_base[x_var], corr_df_base[y_var], method=method)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("n", str(c["n"]))
+        k2.metric("r", "—" if c["r"] is None else f"{c['r']:.4f}")
+        k3.metric("r²", "—" if c["r2"] is None else f"{c['r2']:.4f}")
+        k4.metric("p-value", "—" if c["p_value"] is None else f"{c['p_value']:.4g}")
 
-    fig_scatter = px.scatter(
-        df_plot,
+        if color_mode and factor_a in corr_df_base.columns:
+            df_plot = corr_df_base[[x_var, y_var, factor_a]].dropna()
+            fig = px.scatter(
+                df_plot,
+                x=x_var,
+                y=y_var,
+                color=factor_a,
+                trendline="ols" if method == "pearson" else None,
+                template="simple_white",
+                title=f"Scatter (global): {x_var} vs {y_var} — color={factor_a} (stats globales)",
+            )
+        else:
+            df_plot = corr_df_base[[x_var, y_var]].dropna()
+            fig = px.scatter(
+                df_plot,
+                x=x_var,
+                y=y_var,
+                trendline="ols" if method == "pearson" else None,
+                template="simple_white",
+                title=f"Scatter (global): {x_var} vs {y_var}",
+            )
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    # by_group
+    if not corr_cat:
+        st.warning("No hay columnas categóricas disponibles para estratificar.")
+        return
+
+    default_group = st.session_state.get("corr_group_col")
+    if default_group not in corr_cat:
+        default_group = factor_a if factor_a in corr_cat else corr_cat[0]
+
+    group_col = st.selectbox(
+        "Columna para estratificar (grupos)",
+        options=corr_cat,
+        index=corr_cat.index(default_group),
+        key="corr_group_col",
+    )
+
+    df_xy = corr_df_base[[group_col, x_var, y_var]].dropna()
+    if df_xy.empty:
+        st.warning("No hay filas válidas (NA) para X/Y en el dataset actual.")
+        return
+
+    rows = []
+    for lvl, g in df_xy.groupby(group_col):
+        cc = correlation_stats(g[x_var], g[y_var], method=method)
+        rows.append({"grupo": str(lvl), "n": cc["n"], "r": cc["r"], "r2": cc["r2"], "p_value": cc["p_value"]})
+
+    stats_by_group = pd.DataFrame(rows).sort_values(["grupo"])
+    st.markdown("#### Estadísticos por grupo")
+    st.dataframe(stats_by_group, use_container_width=True, hide_index=True)
+
+    fig = px.scatter(
+        df_xy,
         x=x_var,
         y=y_var,
-        color=factor_a if factor_a in df_plot.columns else None,
-        trendline="ols" if method == "pearson" else None,
+        color=group_col,
         template="simple_white",
-        title=f"Scatter: {x_var} vs {y_var}",
+        title=f"Scatter por grupo: {x_var} vs {y_var} — color={group_col}",
     )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def tab_3_mean_tests() -> None:
@@ -540,22 +706,29 @@ def tab_3_mean_tests() -> None:
     alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="alpha_tab3")
 
     if factor_b:
+        include_interaction = st.checkbox("Incluir interacción A:B", value=True, key="tab3_interaction")
+        anova_type = st.selectbox("Tipo de ANOVA", options=[2, 3], index=0, key="tab3_anova_type")
+        use_block = st.checkbox("Incluir bloque como efecto fijo", value=bool(block_col), key="tab3_use_block")
+
         aov_df, meta, warnings = run_factorial_anova_df(
             df_f,
             y_col=dv_col,
             factor_a=factor_a,
             factor_b=factor_b,
-            block_col=block_col,
-            options=FactorialOptions(alpha=float(alpha), include_interaction=True, anova_type=2),
+            block_col=block_col if (use_block and block_col) else None,
+            options=FactorialOptions(alpha=float(alpha), include_interaction=bool(include_interaction), anova_type=int(anova_type)),
         )
+        st.caption(f"Fórmula: `{meta.get('formula','')}`")
+        st.caption(f"min n por celda (A×B): {meta.get('min_n_per_cell')}")
         st.dataframe(aov_df, use_container_width=True, hide_index=True)
         return
 
+    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_posthoc")
     stats_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
         df_f,
         metric=dv_col,
         group_col=factor_a,
-        options=StatsOptions(alpha=float(alpha), enable_posthoc=True),
+        options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
     )
     st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
