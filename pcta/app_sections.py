@@ -7,8 +7,10 @@ podamos modificar solo secciones específicas sin re-generar todo el archivo.
 BUSCAR RÁPIDO (Ctrl/Cmd+F):
 - BLOQUE DE EDICIÓN: LOAD/INPUT (STRICT -> FREE MODE)
 - BLOQUE DE EDICIÓN: UI HELPERS (DESIGN + FILTERS)
-- BLOQUE DE EDICIÓN: TAB 2 (RESULTADOS) — incluye correlación COMPLETA
+- BLOQUE DE EDICIÓN: TAB 1 (SELECCIÓN)
+- BLOQUE DE EDICIÓN: TAB 2 (RESULTADOS) — descriptivo + distribuciones + correlación COMPLETA
 - BLOQUE DE EDICIÓN: TAB 3 (TEST DE MEDIAS) — omnibus + posthoc bajo demanda
+- BLOQUE DE EDICIÓN: EXPORT
 """
 
 from __future__ import annotations
@@ -84,7 +86,7 @@ def set_state(*, parsed: Optional[ParsedInput], warnings: List[AnalysisWarning])
 
 
 # ======================================================================================
-# Helpers
+# Core helpers (data types, formatting, correlation)
 # ======================================================================================
 
 
@@ -133,37 +135,24 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, List[str]]) -> pd.DataFra
     return out
 
 
-def _excel_sheets(file_bytes: bytes) -> List[str]:
-    try:
-        xls = pd.ExcelFile(BytesIO(file_bytes))
-        return list(xls.sheet_names)
-    except Exception:
-        return []
-
-
-def _read_excel_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
-
-
-def get_active_df() -> Optional[pd.DataFrame]:
+def correlation_stats(x: pd.Series, y: pd.Series, method: str) -> Dict[str, object]:
     """
-    Active dataset:
-      - Free mode: raw_df
-      - Strict mode: parsed.house_summary (or first dataframe if missing)
+    Compute correlation stats for two numeric series.
+    Returns: n, r, r2, p_value
     """
-    if st.session_state.get("raw_mode") and isinstance(st.session_state.get("raw_df"), pd.DataFrame):
-        return st.session_state["raw_df"]
+    d = pd.DataFrame({"x": x, "y": y}).dropna()
+    n = int(len(d))
+    if n < 3:
+        return {"n": n, "r": None, "r2": None, "p_value": None}
 
-    state = get_state()
-    if state.parsed is None:
-        return None
+    if method == "pearson":
+        r, p = sps.pearsonr(d["x"].to_numpy(float), d["y"].to_numpy(float))
+    else:
+        r, p = sps.spearmanr(d["x"].to_numpy(float), d["y"].to_numpy(float))
 
-    dfs = state.parsed.to_dataframes()
-    if "house_summary" in dfs:
-        return dfs["house_summary"].copy()
-    if dfs:
-        return next(iter(dfs.values())).copy()
-    return None
+    r = float(r)
+    p = float(p)
+    return {"n": n, "r": r, "r2": float(r * r), "p_value": p}
 
 
 def _fmt_p(p: object) -> str:
@@ -249,6 +238,44 @@ def describe_by_group(df: pd.DataFrame, group_cols: List[str], metric: str) -> p
     g["range"] = g["max"] - g["min"]
     g["cv_pct"] = g.apply(lambda r: (np.nan if r["mean"] == 0 else 100.0 * r["sd"] / abs(r["mean"])), axis=1)
     return g
+
+
+# ======================================================================================
+# Free mode Excel helpers
+# ======================================================================================
+
+
+def _excel_sheets(file_bytes: bytes) -> List[str]:
+    try:
+        xls = pd.ExcelFile(BytesIO(file_bytes))
+        return list(xls.sheet_names)
+    except Exception:
+        return []
+
+
+def _read_excel_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
+
+
+def get_active_df() -> Optional[pd.DataFrame]:
+    """
+    Active dataset:
+      - Free mode: raw_df
+      - Strict mode: parsed.house_summary (or first dataframe if missing)
+    """
+    if st.session_state.get("raw_mode") and isinstance(st.session_state.get("raw_df"), pd.DataFrame):
+        return st.session_state["raw_df"]
+
+    state = get_state()
+    if state.parsed is None:
+        return None
+
+    dfs = state.parsed.to_dataframes()
+    if "house_summary" in dfs:
+        return dfs["house_summary"].copy()
+    if dfs:
+        return next(iter(dfs.values())).copy()
+    return None
 
 
 # ======================================================================================
@@ -422,7 +449,7 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
 
 
 # ======================================================================================
-# TAB 1
+# BLOQUE DE EDICIÓN: TAB 1 (SELECCIÓN)
 # ======================================================================================
 
 
@@ -728,7 +755,7 @@ def tab_3_mean_tests() -> None:
         st.info("Posthoc factorial: siguiente iteración (si lo necesitas).")
         return
 
-    # 1-factor omnibus (no posthoc)
+    # Omnibus without posthoc
     st.markdown("### Omnibus (selección automática del test)")
     omni_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
         df_f,
@@ -736,6 +763,7 @@ def tab_3_mean_tests() -> None:
         group_col=factor_a,
         options=StatsOptions(alpha=float(alpha), enable_posthoc=False),
     )
+
     if omni_df.empty:
         st.warning("No se pudo calcular el test omnibus.")
         return
@@ -744,7 +772,7 @@ def tab_3_mean_tests() -> None:
     p_val = row.get("p_value")
     test_name = str(row.get("test"))
 
-    # Cards
+    # Cards summary
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Test", test_name)
     c2.metric("p-value", _fmt_p(p_val))
@@ -771,7 +799,7 @@ def tab_3_mean_tests() -> None:
         st.warning("Inferencia deshabilitada: se requiere al menos n>=2 por grupo para p-values.")
         return
 
-    # Posthoc gating
+    # Posthoc policy
     st.divider()
     st.markdown("### Posthoc (test de medias)")
 
@@ -793,11 +821,12 @@ def tab_3_mean_tests() -> None:
 
     if policy == "never":
         return
+
     if policy == "auto_if_significant" and not sig:
         st.info("Omnibus no significativo: posthoc omitido. Cambia a 'Siempre' si deseas explorarlo.")
         return
 
-    # Run again with posthoc enabled
+    # Run with posthoc enabled
     full_df, *_ = run_inferential_statistics_df(
         df_f,
         metric=dv_col,
@@ -820,7 +849,7 @@ def tab_3_mean_tests() -> None:
 
 
 # ======================================================================================
-# Export (placeholder)
+# BLOQUE DE EDICIÓN: EXPORT
 # ======================================================================================
 
 
