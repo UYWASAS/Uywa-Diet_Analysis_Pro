@@ -42,13 +42,13 @@ def init_state() -> None:
     st.session_state.setdefault("block_col", None)
     st.session_state.setdefault("filters", {})
 
-    # Correlación (MÓDULO INDEPENDIENTE)
-    st.session_state.setdefault("corr_scope", "post_filter")  # post_filter | full
-    st.session_state.setdefault("corr_x_var", None)
-    st.session_state.setdefault("corr_y_var", None)
-    st.session_state.setdefault("corr_method", "pearson")
-    st.session_state.setdefault("corr_keep_x_fixed", True)
-    st.session_state.setdefault("corr_sync_y_with_dv", False)
+    # Correlación (módulo independiente)
+    st.session_state.setdefault("corr_scope", "post_filter")  # widget key: corr_scope
+    st.session_state.setdefault("corr_x_var", None)  # widget key: corr_x_var
+    st.session_state.setdefault("corr_y_var", None)  # widget key: corr_y_var
+    st.session_state.setdefault("corr_method", "pearson")  # widget key: corr_method
+    st.session_state.setdefault("corr_keep_x_fixed", True)  # widget key: corr_keep_x_fixed
+    st.session_state.setdefault("corr_sync_y_with_dv", False)  # widget key: corr_sync_y_with_dv
 
     # Plots
     st.session_state.setdefault("show_violin", True)
@@ -160,7 +160,7 @@ def render_design_controls(
         fa_default = cat[0]
 
     dv_col = st.selectbox("Variable dependiente (Y)", options=num, index=num.index(dv_default), key=f"{prefix_key}_dv")
-    st.session_state["dv_col"] = dv_col
+    st.session_state["dv_col"] = dv_col  # OK: NO es key de widget global; es nuestra app key
 
     factor_a = st.selectbox("Factor A (principal)", options=cat, index=cat.index(fa_default), key=f"{prefix_key}_fa")
     st.session_state["factor_a"] = factor_a
@@ -250,20 +250,7 @@ def format_desc_table(desc: pd.DataFrame, *, group_cols: List[str], decimals: in
 
     rename = {gc: f"Factor_{i+1}" for i, gc in enumerate(group_cols)}
     rename.update(
-        {
-            "n": "n",
-            "media": "Media",
-            "sd": "SD",
-            "cv_pct": "CV%",
-            "min": "Mín",
-            "p10": "P10",
-            "p25": "P25",
-            "mediana": "Mediana",
-            "p75": "P75",
-            "p90": "P90",
-            "max": "Máx",
-            "rango": "Rango",
-        }
+        {"n": "n", "media": "Media", "sd": "SD", "cv_pct": "CV%", "min": "Mín", "p10": "P10", "p25": "P25", "mediana": "Mediana", "p75": "P75", "p90": "P90", "max": "Máx", "rango": "Rango"}
     )
     return out.rename(columns=rename)
 
@@ -337,8 +324,8 @@ def render_sidebar_minimal(*, user: Dict[str, object]) -> SidebarResult:
         )
 
         logout_button()
-
         st.divider()
+
         st.subheader("Carga de archivos")
         uploaded_main = st.file_uploader(
             "Ensayo (Excel .xlsx o CSV .csv)",
@@ -360,12 +347,10 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
     file_name = uploaded_main.name
     file_bytes = uploaded_main.getvalue()
 
-    # Reset
     st.session_state["raw_mode"] = False
     st.session_state["raw_df"] = None
     st.session_state["raw_sheet_name"] = None
 
-    # 1) Intento parseo estricto
     try:
         parsed = parse_uploaded_file(file_name, file_bytes)
         set_state(parsed=parsed, warnings=[])
@@ -374,19 +359,15 @@ def maybe_parse_main_upload(uploaded_main: Optional[object]) -> None:
         st.warning(f"Modo PCTA estándar no aplica. Activando Modo Libre. Detalle: {e}")
         set_state(parsed=None, warnings=[])
 
-    # 2) Modo libre
     lower = file_name.lower()
-
     if lower.endswith(".xlsx"):
         sheets = _excel_sheets(file_bytes)
         if not sheets:
             st.error("No pude leer hojas del Excel en Modo Libre.")
             return
-
         with st.sidebar:
             st.subheader("Modo Libre — hoja a usar")
             sheet = st.selectbox("Hoja", options=sheets, index=0, key="raw_sheet_select")
-
         st.session_state["raw_sheet_name"] = sheet
         st.session_state["raw_df"] = _read_excel_sheet(file_bytes, sheet_name=sheet)
         st.session_state["raw_mode"] = True
@@ -426,99 +407,53 @@ def tab_2_results_for_selected_variable() -> None:
         st.info("Carga un archivo primero.")
         return
 
-    # Diseño (para descriptivo/distribuciones)
-    st.markdown("### A) Diseño (para descriptivo y distribuciones)")
+    st.markdown("### A) Diseño (para descriptivo / distribuciones)")
     dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab2_design")
     df_post = apply_filters(df, filters)
-
     if df_post.empty:
         st.error("Con los filtros actuales no quedan filas.")
         return
 
     group_cols = [factor_a] + ([factor_b] if factor_b else [])
 
-    # --- Descriptiva ---
     st.divider()
     st.markdown("### B) Resumen descriptivo")
     decimals = st.slider("Decimales", 0, 6, 2, key="tab2_decimals")
     desc = describe_by_group(df_post, group_cols, dv_col)
     st.dataframe(format_desc_table(desc, group_cols=group_cols, decimals=decimals), use_container_width=True, hide_index=True)
 
-    # --- Distribuciones (plots) ---
-    st.divider()
-    st.markdown("### C) Distribuciones (gráficas)")
+    # Plots + correlación independiente
     try:
         import plotly.express as px
     except Exception:
         st.error("Plotly no está instalado.")
         return
 
+    st.divider()
+    st.markdown("### C) Distribuciones (gráficas)")
     bins = st.slider("Bins (histograma)", 5, 100, 30, key="hist_bins")
-    fig_hist = px.histogram(df_post, x=dv_col, nbins=bins, template="simple_white", title=f"Distribución de Y: {dv_col}")
-    st.plotly_chart(fig_hist, use_container_width=True)
+    st.plotly_chart(px.histogram(df_post, x=dv_col, nbins=bins, template="simple_white"), use_container_width=True)
 
     show_violin = st.checkbox("Ver violin plot", value=True, key="show_violin")
     show_points = st.checkbox("Mostrar puntos (strip)", value=True, key="show_points")
 
     if factor_b:
         fig_dist = (
-            px.violin(
-                df_post,
-                x=factor_a,
-                y=dv_col,
-                color=factor_b,
-                box=True,
-                points="all" if show_points else False,
-                template="simple_white",
-                title=f"{dv_col} por {factor_a} (color: {factor_b})",
-            )
+            px.violin(df_post, x=factor_a, y=dv_col, color=factor_b, box=True, points="all" if show_points else False, template="simple_white")
             if show_violin
-            else px.box(
-                df_post,
-                x=factor_a,
-                y=dv_col,
-                color=factor_b,
-                points="all" if show_points else False,
-                template="simple_white",
-                title=f"{dv_col} por {factor_a} (color: {factor_b})",
-            )
+            else px.box(df_post, x=factor_a, y=dv_col, color=factor_b, points="all" if show_points else False, template="simple_white")
         )
     else:
         fig_dist = (
-            px.violin(
-                df_post,
-                x=factor_a,
-                y=dv_col,
-                box=True,
-                points="all" if show_points else False,
-                template="simple_white",
-                title=f"{dv_col} por {factor_a}",
-            )
+            px.violin(df_post, x=factor_a, y=dv_col, box=True, points="all" if show_points else False, template="simple_white")
             if show_violin
-            else px.box(
-                df_post,
-                x=factor_a,
-                y=dv_col,
-                points="all" if show_points else False,
-                template="simple_white",
-                title=f"{dv_col} por {factor_a}",
-            )
+            else px.box(df_post, x=factor_a, y=dv_col, points="all" if show_points else False, template="simple_white")
         )
     st.plotly_chart(fig_dist, use_container_width=True)
 
-    # --- Supuestos ---
     st.divider()
-    st.markdown("### D) Supuestos (informativo; sobre Factor A)")
-    tests = homogeneity_tests(df_post, factor_a, dv_col)
-    c1, c2 = st.columns(2)
-    c1.metric("Levene p", "—" if tests["levene_p"] is None else f"{tests['levene_p']:.4f}")
-    c2.metric("Shapiro min p", "—" if tests["shapiro_min_p"] is None else f"{tests['shapiro_min_p']:.4f}")
+    st.markdown("### D) Correlación (módulo independiente)")
 
-    # --- Correlación independiente ---
-    st.divider()
-    st.markdown("### E) Correlación (módulo independiente)")
-
-    # Scope selector
     corr_scope = st.radio(
         "Dataset base para correlación",
         options=["post_filter", "full"],
@@ -527,23 +462,23 @@ def tab_2_results_for_selected_variable() -> None:
         key="corr_scope",
         horizontal=True,
     )
-    st.session_state["corr_scope"] = corr_scope
-
     corr_df = df_post if corr_scope == "post_filter" else df
 
-    # candidates
     corr_num = numeric_cols(corr_df)
     if len(corr_num) < 2:
         st.info("No hay suficientes variables numéricas para correlación.")
         return
 
-    # Optional sync: if enabled, set corr_y_var = dv_col (but do not force if invalid)
-    sync_y = st.checkbox("Sincronizar Y de correlación con Y del diseño", value=st.session_state.get("corr_sync_y_with_dv", False), key="corr_sync_y_with_dv")
-    st.session_state["corr_sync_y_with_dv"] = sync_y
+    sync_y = st.checkbox(
+        "Sincronizar Y de correlación con Y del diseño",
+        value=bool(st.session_state.get("corr_sync_y_with_dv", False)),
+        key="corr_sync_y_with_dv",
+    )
     if sync_y and dv_col in corr_num:
-        st.session_state["corr_y_var"] = dv_col
+        current_y = st.session_state.get("corr_y_var")
+        if (current_y is None) or (current_y not in corr_num):
+            st.session_state["corr_y_var"] = dv_col
 
-    # Defaults
     x_default = st.session_state.get("corr_x_var") or corr_num[0]
     y_default = st.session_state.get("corr_y_var") or (corr_num[1] if len(corr_num) > 1 else corr_num[0])
     if x_default not in corr_num:
@@ -551,29 +486,16 @@ def tab_2_results_for_selected_variable() -> None:
     if y_default not in corr_num:
         y_default = corr_num[1] if len(corr_num) > 1 else corr_num[0]
 
-    keep_x_fixed = st.checkbox("Mantener X fijo (solo cambiar Y)", value=st.session_state.get("corr_keep_x_fixed", True), key="corr_keep_x_fixed")
-    st.session_state["corr_keep_x_fixed"] = keep_x_fixed
+    st.checkbox("Mantener X fijo (solo cambiar Y)", value=bool(st.session_state.get("corr_keep_x_fixed", True)), key="corr_keep_x_fixed")
 
     cL, cM, cR = st.columns([1, 1, 1])
     with cL:
-        x_var = st.selectbox(
-            "Variable X (correlación)",
-            options=corr_num,
-            index=corr_num.index(x_default),
-            key="corr_x_var",
-            disabled=False if not keep_x_fixed else False,  # X siempre editable; el "fijo" afecta defaults/flujo
-        )
+        x_var = st.selectbox("Variable X (correlación)", options=corr_num, index=corr_num.index(x_default), key="corr_x_var")
     with cM:
-        y_var = st.selectbox(
-            "Variable Y (correlación)",
-            options=corr_num,
-            index=corr_num.index(y_default),
-            key="corr_y_var",
-        )
+        y_var = st.selectbox("Variable Y (correlación)", options=corr_num, index=corr_num.index(y_default), key="corr_y_var")
     with cR:
         method = st.selectbox("Método", options=["pearson", "spearman"], index=0, key="corr_method")
 
-    # If keep_x_fixed, keep x when user changes Y (Streamlit state already does that).
     if x_var == y_var:
         st.warning("Selecciona X ≠ Y.")
         return
@@ -585,7 +507,11 @@ def tab_2_results_for_selected_variable() -> None:
     k3.metric("r²", "—" if corr["r2"] is None else f"{corr['r2']:.4f}")
     k4.metric("p-value", "—" if corr["p_value"] is None else f"{corr['p_value']:.4g}")
 
-    df_plot = corr_df[[x_var, y_var] + ([factor_a] if factor_a in corr_df.columns else [])].dropna()
+    plot_cols = [x_var, y_var]
+    if factor_a in corr_df.columns:
+        plot_cols.append(factor_a)
+    df_plot = corr_df[plot_cols].dropna()
+
     fig_scatter = px.scatter(
         df_plot,
         x=x_var,
@@ -599,7 +525,7 @@ def tab_2_results_for_selected_variable() -> None:
 
 
 def tab_3_mean_tests() -> None:
-    st.subheader("3) Inferencial (RAW flexible)")
+    st.subheader("3) Test de medias (inferencial)")
     df = get_active_df()
     if df is None:
         st.info("Carga un archivo primero.")
@@ -607,37 +533,29 @@ def tab_3_mean_tests() -> None:
 
     dv_col, factor_a, factor_b, block_col, filters = render_design_controls(df, prefix_key="tab3")
     df_f = apply_filters(df, filters)
-
     if df_f.empty:
-        st.error("Con los filtros actuales no quedan filas para analizar.")
+        st.error("Con los filtros actuales no quedan filas.")
         return
 
     alpha = st.number_input("Alpha", min_value=0.001, max_value=0.2, value=0.05, step=0.005, key="alpha_tab3")
 
     if factor_b:
-        include_interaction = st.checkbox("Incluir interacción A:B", value=True, key="tab3_interaction")
-        anova_type = st.selectbox("Tipo de ANOVA", options=[2, 3], index=0, key="tab3_anova_type")
-        use_block = st.checkbox("Incluir bloque como efecto fijo", value=bool(block_col), key="tab3_use_block")
-
         aov_df, meta, warnings = run_factorial_anova_df(
             df_f,
             y_col=dv_col,
             factor_a=factor_a,
             factor_b=factor_b,
-            block_col=block_col if (use_block and block_col) else None,
-            options=FactorialOptions(alpha=float(alpha), include_interaction=bool(include_interaction), anova_type=int(anova_type)),
+            block_col=block_col,
+            options=FactorialOptions(alpha=float(alpha), include_interaction=True, anova_type=2),
         )
-        st.caption(f"Fórmula: `{meta.get('formula','')}`")
-        st.caption(f"min n por celda (A×B): {meta.get('min_n_per_cell')}")
         st.dataframe(aov_df, use_container_width=True, hide_index=True)
         return
 
-    enable_posthoc = st.checkbox("Posthoc (si aplica)", value=True, key="tab3_posthoc")
     stats_df, rep, min_n, enabled, warnings = run_inferential_statistics_df(
         df_f,
         metric=dv_col,
         group_col=factor_a,
-        options=StatsOptions(alpha=float(alpha), enable_posthoc=bool(enable_posthoc)),
+        options=StatsOptions(alpha=float(alpha), enable_posthoc=True),
     )
     st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
