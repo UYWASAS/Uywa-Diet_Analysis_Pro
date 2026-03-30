@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -870,13 +870,17 @@ def tab_4_productive_kpis() -> None:
     
     Requiere inputs manuales de precios/costos del usuario.
     """
-    from pcta.core.productive_kpis import (
-        ProductiveKPIInputs,
-        compute_productive_kpis_batch,
-        kpis_to_dataframe,
-        compute_summary_by_treatment,
-        compute_total_summary,
-    )
+    try:
+        from pcta.core.productive_kpis import (
+            ProductiveKPIInputs,
+            compute_productive_kpis_batch,
+            kpis_to_dataframe,
+            compute_summary_by_treatment,
+            compute_total_summary,
+        )
+    except ImportError as e:
+        st.error(f"No se pudo importar módulo de KPIs productivos: {e}")
+        return
 
     st.subheader("4) KPIs Productivos — Análisis Económico Integral")
 
@@ -1073,37 +1077,19 @@ def tab_4_productive_kpis() -> None:
                 delta=f"{totals.get('avg_margin_pct', 0):.1f}%" if totals.get('avg_margin_pct') else "—"
             )
 
-            # Resumen en tabla pequeña (opcional)
+            # Resumen en tabla pequeña
             st.markdown("#### Financiero global")
             financial_summary = pd.DataFrame([
-                {
-                    "Métrica": "Ingresos totales",
-                    "Valor ($)": totals.get('total_revenue', 0)
-                },
-                {
-                    "Métrica": "Costo alimento",
-                    "Valor ($)": totals.get('total_feed_cost', 0)
-                },
-                {
-                    "Métrica": "Costo pollito",
-                    "Valor ($)": totals.get('total_bird_cost', 0)
-                },
-                {
-                    "Métrica": "Otros costos",
-                    "Valor ($)": totals.get('total_other_cost', 0)
-                },
-                {
-                    "Métrica": "Costo total",
-                    "Valor ($)": totals.get('total_cost', 0)
-                },
-                {
-                    "Métrica": "Margen bruto",
-                    "Valor ($)": totals.get('total_margin', 0)
-                },
+                {"Métrica": "Ingresos totales", "Valor ($)": totals.get('total_revenue', 0)},
+                {"Métrica": "Costo alimento", "Valor ($)": totals.get('total_feed_cost', 0)},
+                {"Métrica": "Costo pollito", "Valor ($)": totals.get('total_bird_cost', 0)},
+                {"Métrica": "Otros costos", "Valor ($)": totals.get('total_other_cost', 0)},
+                {"Métrica": "Costo total", "Valor ($)": totals.get('total_cost', 0)},
+                {"Métrica": "Margen bruto", "Valor ($)": totals.get('total_margin', 0)},
             ])
             st.dataframe(financial_summary, use_container_width=True, hide_index=True)
 
-            # ---- Gráficos (opcional pero visual) ----
+            # ---- Gráficos ----
             st.divider()
             st.markdown("### F) Visualización")
 
@@ -1139,24 +1125,9 @@ def tab_4_productive_kpis() -> None:
                 # Barras: Ingresos vs Costos por tratamiento
                 if not summary_treatment.empty and "treatment" in summary_treatment.columns:
                     fig_bars = go.Figure(data=[
-                        go.Bar(
-                            name="Ingresos",
-                            x=summary_treatment["treatment"],
-                            y=summary_treatment["revenue_total"],
-                            marker_color="#4CAF50"
-                        ),
-                        go.Bar(
-                            name="Costos",
-                            x=summary_treatment["treatment"],
-                            y=summary_treatment["total_cost"],
-                            marker_color="#f44336"
-                        ),
-                        go.Bar(
-                            name="Margen",
-                            x=summary_treatment["treatment"],
-                            y=summary_treatment["margin_total"],
-                            marker_color="#2176ff"
-                        ),
+                        go.Bar(name="Ingresos", x=summary_treatment["treatment"], y=summary_treatment["revenue_total"], marker_color="#4CAF50"),
+                        go.Bar(name="Costos", x=summary_treatment["treatment"], y=summary_treatment["total_cost"], marker_color="#f44336"),
+                        go.Bar(name="Margen", x=summary_treatment["treatment"], y=summary_treatment["margin_total"], marker_color="#2176ff"),
                     ])
                     fig_bars.update_layout(
                         title="Ingresos, Costos y Margen por Tratamiento",
