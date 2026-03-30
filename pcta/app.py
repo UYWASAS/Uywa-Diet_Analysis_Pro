@@ -26,6 +26,7 @@ from pcta.app_sections import (  # noqa: E402
     tab_1_select_variable_and_run,
     tab_2_results_for_selected_variable,
     tab_3_mean_tests,
+    tab_4_productive_kpis,
     tab_export,
 )
 
@@ -77,6 +78,31 @@ def _apply_global_css() -> None:
             box-shadow: 0px 2px 10px rgba(16, 24, 40, 0.06);
         }
         .pcta-muted { color: #4b5563; font-size: 0.95rem; }
+        
+        /* Estilos adicionales para Tab 4 */
+        .kpi-executive-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 10px 0;
+            box-shadow: 0px 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        .kpi-executive-card h3 {
+            margin-top: 0;
+            font-size: 0.9rem;
+            font-weight: 600;
+            opacity: 0.9;
+        }
+        .kpi-executive-value {
+            font-size: 2.2rem;
+            font-weight: 700;
+            margin: 10px 0;
+        }
+        .kpi-executive-delta {
+            font-size: 0.85rem;
+            opacity: 0.85;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -102,11 +128,17 @@ maybe_parse_main_upload(sidebar.uploaded_main)
 # Main
 st.title("PCTA — Analizador de Ensayos Comerciales Avícolas")
 st.markdown(
-    "<div class='pcta-muted'>Flujo: Selección de variable → Resultados → Test de medias → Exportar</div>",
+    "<div class='pcta-muted'>Flujo: Selección → Resultados → Test de medias → KPIs Productivos → Exportar</div>",
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["1) Selección", "2) Resultados", "3) Test de medias", "4) Exportar"])
+tabs = st.tabs([
+    "1) Selección",
+    "2) Resultados",
+    "3) Test de medias",
+    "4) KPIs Productivos",
+    "5) Exportar"
+])
 
 with tabs[0]:
     tab_1_select_variable_and_run()
@@ -115,4 +147,6 @@ with tabs[1]:
 with tabs[2]:
     tab_3_mean_tests()
 with tabs[3]:
+    tab_4_productive_kpis()
+with tabs[4]:
     tab_export()
