@@ -32,6 +32,20 @@ from pcta.core.io import parse_uploaded_file
 from pcta.core.schemas import AnalysisWarning, ParsedInput
 from pcta.core.stats import StatsOptions, run_inferential_statistics_df
 
+# ===== IMPORTACIONES PARA TAB 4 (necesarias globalmente) =====
+try:
+    from pcta.core.productive_kpis import (
+        ProductiveKPIInputs,
+        compute_productive_kpis_batch,
+        kpis_to_dataframe,
+        compute_summary_by_treatment,
+        compute_total_summary,
+    )
+    from pcta.core.schemas import TrialUnitInput, UnitType
+    PRODUCTIVE_KPI_AVAILABLE = True
+except ImportError:
+    PRODUCTIVE_KPI_AVAILABLE = False
+# ===== FIN IMPORTACIONES PARA TAB 4 =====
 
 # ======================================================================================
 # State
@@ -955,15 +969,9 @@ def _tab4_modo_manual() -> None:
     Modo Manual: usuario ingresa múltiples tratamientos manualmente.
     Sistema de acordeones para ingresar datos y luego compara.
     """
-    # Importar AQUÍ (fuera del try/except para que esté disponible en todo el scope)
-    from pcta.core.productive_kpis import (
-        ProductiveKPIInputs,
-        compute_productive_kpis_batch,
-        kpis_to_dataframe,
-        compute_summary_by_treatment,
-        compute_total_summary,
-    )
-    from pcta.core.schemas import TrialUnitInput, UnitType
+    if not PRODUCTIVE_KPI_AVAILABLE:
+        st.error("❌ Módulo de KPIs productivos no disponible. Verifica las dependencias.")
+        return
 
     st.markdown("#### Ingreso manual de múltiples tratamientos")
     st.info("📋 Ingresa datos de cada tratamiento en los acordeones abajo. Luego analiza y compara.")
@@ -1136,7 +1144,7 @@ def _tab4_modo_manual() -> None:
                 unit.other_variable_costs_total = kpi_inputs.other_costs_per_bird * unit.birds_placed
                 units_list.append(unit)
 
-            # AQUÍ compute_productive_kpis_batch está disponible (importado al inicio de la función)
+            # Ahora compute_productive_kpis_batch ESTÁ DISPONIBLE (importado al nivel del módulo)
             kpis, warnings = compute_productive_kpis_batch(units_list, kpi_inputs)
 
         except Exception as calc_error:
@@ -1195,7 +1203,7 @@ def _tab4_modo_manual() -> None:
             if not summary_treatment.empty:
                 st.dataframe(summary_treatment.round(2), use_container_width=True, hide_index=True)
         except Exception as summary_error:
-            st.warning(f"⚠️ Error en resumen: {summary_error}")
+            st.warning(f"⚠️ Error: {summary_error}")
 
         # ---- Totales globales ----
         st.divider()
@@ -1203,120 +1211,35 @@ def _tab4_modo_manual() -> None:
 
         try:
             totals = compute_total_summary(df_kpis)
+            if totals:
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Total aves", f"{totals.get('total_birds_placed', 0):,.0f}")
+                col2.metric("Alimento total", f"{totals.get('total_feed_consumed_kg', 0):,.0f} kg")
+                col3.metric("FCR prom.", f"{totals.get('avg_fcr', 0):.2f}")
+                col4.metric("EPEF prom.", f"{totals.get('avg_epef', 0):.1f}" if totals.get('avg_epef') else "—")
+                col5.metric("Margen total", f"${totals.get('total_margin', 0):,.2f}")
         except Exception as totals_error:
-            st.error(f"❌ Error en totales: {totals_error}")
-            return
-
-        if totals:
-            col1, col2, col3, col4, col5 = st.columns(5)
-
-            col1.metric(
-                "Total aves",
-                f"{totals.get('total_birds_placed', 0):,.0f}",
-                delta=f"{totals.get('total_mortality', 0)} muertas"
-            )
-            col2.metric(
-                "Alimento total",
-                f"{totals.get('total_feed_consumed_kg', 0):,.0f} kg",
-            )
-            col3.metric(
-                "FCR promedio",
-                f"{totals.get('avg_fcr', 0):.2f}",
-            )
-            col4.metric(
-                "EPEF promedio",
-                f"{totals.get('avg_epef', 0):.1f}" if totals.get('avg_epef') else "—",
-            )
-            col5.metric(
-                "Margen total",
-                f"${totals.get('total_margin', 0):,.2f}",
-            )
+            st.warning(f"⚠️ Error: {totals_error}")
 
         # ---- Gráficos ----
         st.divider()
-        st.markdown("### H) Gráficos comparativos")
+        st.markdown("### H) Gráficos")
 
         try:
             import plotly.graph_objects as go
             import plotly.express as px
 
-            # Gráfico 1: Barras
             fig_bars = go.Figure()
-
-            fig_bars.add_trace(go.Bar(
-                name="Ingresos",
-                x=df_kpis["treatment"],
-                y=df_kpis["revenue_total"],
-                marker_color="#4CAF50"
-            ))
-
-            fig_bars.add_trace(go.Bar(
-                name="Costo Total",
-                x=df_kpis["treatment"],
-                y=df_kpis["total_cost"],
-                marker_color="#f44336"
-            ))
-
-            fig_bars.add_trace(go.Bar(
-                name="Margen",
-                x=df_kpis["treatment"],
-                y=df_kpis["margin_total"],
-                marker_color="#2176ff"
-            ))
-
-            fig_bars.update_layout(
-                title="Ingresos vs Costos vs Margen",
-                barmode="group",
-                template="plotly_white",
-                height=450
-            )
+            fig_bars.add_trace(go.Bar(name="Ingresos", x=df_kpis["treatment"], y=df_kpis["revenue_total"], marker_color="#4CAF50"))
+            fig_bars.add_trace(go.Bar(name="Costo", x=df_kpis["treatment"], y=df_kpis["total_cost"], marker_color="#f44336"))
+            fig_bars.add_trace(go.Bar(name="Margen", x=df_kpis["treatment"], y=df_kpis["margin_total"], marker_color="#2176ff"))
+            fig_bars.update_layout(title="Ingresos vs Costos", barmode="group", template="plotly_white", height=400)
             st.plotly_chart(fig_bars, use_container_width=True)
 
-            # Gráfico 2: FCR y EPEF
-            fig_eff = go.Figure()
-
-            fig_eff.add_trace(go.Bar(
-                name="FCR",
-                x=df_kpis["treatment"],
-                y=df_kpis["fcr"],
-                marker_color="#FF9800",
-                yaxis="y1"
-            ))
-
-            fig_eff.add_trace(go.Scatter(
-                name="EPEF",
-                x=df_kpis["treatment"],
-                y=df_kpis["epef"],
-                mode="lines+markers",
-                marker=dict(size=10, color="#2176ff"),
-                yaxis="y2"
-            ))
-
-            fig_eff.update_layout(
-                title="FCR y EPEF por Tratamiento",
-                template="plotly_white",
-                height=450,
-                yaxis=dict(title="FCR", side="left"),
-                yaxis2=dict(title="EPEF", overlaying="y", side="right")
-            )
-            st.plotly_chart(fig_eff, use_container_width=True)
-
-            # Gráfico 3: Margen %
-            fig_margin = px.bar(
-                df_kpis,
-                x="treatment",
-                y="margin_pct",
-                title="Rentabilidad (%)",
-                color="margin_pct",
-                color_continuous_scale="RdYlGn"
-            )
-            fig_margin.update_layout(height=450)
-            st.plotly_chart(fig_margin, use_container_width=True)
-
         except ImportError:
-            st.info("📦 Instala Plotly: `pip install plotly`")
+            st.info("📦 Instala: pip install plotly")
         except Exception as plot_error:
-            st.warning(f"⚠️ Error en gráficos: {plot_error}")
+            st.warning(f"Error en gráficos: {plot_error}")
 
         # ---- Análisis comparativo ----
         st.divider()
