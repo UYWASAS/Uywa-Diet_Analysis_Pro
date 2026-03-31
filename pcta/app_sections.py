@@ -856,7 +856,6 @@ def tab_3_mean_tests() -> None:
     st.dataframe(ph_df, use_container_width=True, hide_index=True)
 
 
-
 # ======================================================================================
 # BLOQUE DE EDICIÓN: TAB 4 (KPIS PRODUCTIVOS) — Análisis económico integral
 # ======================================================================================
@@ -868,7 +867,7 @@ def tab_4_productive_kpis() -> None:
     
     Soporta 2 modos:
     1. MODO PCTA: usa estructura HOUSE_SUMMARY (datos cargados)
-    2. MODO MANUAL: el usuario ingresa valores manualmente
+    2. MODO MANUAL: el usuario ingresa múltiples tratamientos manualmente y compara
     
     Cálculos:
     - Consumo de alimento, conversión alimenticia (FCR)
@@ -902,7 +901,7 @@ def tab_4_productive_kpis() -> None:
         options=["modo_pcta", "modo_manual"],
         format_func=lambda v: {
             "modo_pcta": "📊 MODO PCTA (cargar desde archivo)",
-            "modo_manual": "✏️ MODO MANUAL (ingresar valores manualmente)",
+            "modo_manual": "✏️ MODO MANUAL (múltiples tratamientos con comparación)",
         }[v],
         index=0 if has_pcta_data else 1,
         key="tab4_mode",
@@ -969,21 +968,25 @@ def _tab4_modo_pcta() -> None:
         return
 
     # Parámetros económicos
+    st.divider()
     _render_economic_inputs()
     
     # Cálculos
+    st.divider()
     _render_kpi_results(units_filtered)
 
 
 def _tab4_modo_manual() -> None:
     """
-    Modo Manual: usuario ingresa valores productivos manualmente.
+    Modo Manual: usuario ingresa múltiples tratamientos manualmente.
+    Sistema de acordeones para ingresar datos y luego compara.
     """
     try:
         from pcta.core.productive_kpis import (
             ProductiveKPIInputs,
             compute_unit_kpis,
             kpis_to_dataframe,
+            compute_summary_by_treatment,
             compute_total_summary,
         )
         from pcta.core.schemas import TrialUnitInput, UnitType
@@ -991,115 +994,165 @@ def _tab4_modo_manual() -> None:
         st.error(f"Error de importación: {e}")
         return
 
-    st.markdown("#### Ingreso manual de datos productivos")
-    st.info("Ingresa los parámetros de tu ensayo manualmente para calcular KPIs económicos.")
+    st.markdown("#### Ingreso manual de múltiples tratamientos")
+    st.info("📋 Ingresa datos de cada tratamiento en los acordeones abajo. Luego analiza y compara.")
 
-    # ---- PANEL A: Datos generales ----
+    # ---- PANEL INICIAL: Parámetros globales ----
     st.divider()
-    st.markdown("### B) Datos generales del ensayo")
+    st.markdown("### B) Parámetros globales del ensayo")
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        trial_id = st.text_input("ID del ensayo", value="TRIAL_MANUAL", key="tab4_trial_id")
+        trial_id = st.text_input("ID del ensayo", value="TRIAL_MANUAL", key="tab4_trial_id_global")
     with col2:
-        unit_id = st.text_input("ID de la unidad (galpón)", value="GALPÓN_01", key="tab4_unit_id")
+        days_cycle = st.number_input("Días de ciclo (igual para todos)", min_value=1, value=42, step=1, key="tab4_days_global")
     with col3:
-        treatment = st.text_input("Tratamiento", value="A", key="tab4_treatment")
-    with col4:
-        days_cycle = st.number_input("Días de ciclo", min_value=1, value=42, step=1, key="tab4_days")
-
-    # ---- PANEL B: Datos de aves ----
-    st.divider()
-    st.markdown("### C) Datos de aves")
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        birds_placed = st.number_input(
-            "Aves colocadas",
+        num_treatments = st.number_input(
+            "¿Cuántos tratamientos deseas evaluar?",
             min_value=1,
-            value=10000,
-            step=100,
-            key="tab4_birds_placed"
-        )
-    with col2:
-        mortality_total = st.number_input(
-            "Aves muertas",
-            min_value=0,
-            value=200,
-            step=10,
-            key="tab4_mortality_total"
-        )
-    with col3:
-        bw_initial_g = st.number_input(
-            "Peso inicial (g)",
-            min_value=1.0,
-            value=42.0,
-            step=1.0,
-            key="tab4_bw_initial"
-        )
-    with col4:
-        bw_final_g = st.number_input(
-            "Peso final (g)",
-            min_value=1.0,
-            value=2400.0,
-            step=10.0,
-            key="tab4_bw_final"
+            max_value=10,
+            value=3,
+            step=1,
+            key="tab4_num_treatments"
         )
 
-    # ---- PANEL C: Alimento ----
+    # ---- PANEL: Ingresar datos de cada tratamiento ----
     st.divider()
-    st.markdown("### D) Consumo de alimento")
+    st.markdown("### C) Datos de cada tratamiento")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        feed_delivered_kg = st.number_input(
-            "Alimento suministrado (kg)",
-            min_value=0.0,
-            value=20000.0,
-            step=100.0,
-            key="tab4_feed_delivered"
-        )
-    with col2:
-        feed_refusals_kg = st.number_input(
-            "Alimento rechazado/perdido (kg)",
-            min_value=0.0,
-            value=500.0,
-            step=50.0,
-            key="tab4_feed_refusals"
-        )
+    treatment_units: Dict[str, TrialUnitInput] = {}
 
-    # ---- PANEL D: Parámetros económicos ----
+    for idx in range(int(num_treatments)):
+        with st.expander(
+            f"📝 Tratamiento {idx + 1}",
+            expanded=(idx == 0)  # Solo el primero expandido por defecto
+        ):
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                treatment_name = st.text_input(
+                    f"Nombre del tratamiento",
+                    value=f"Trat_{chr(65 + idx)}",  # A, B, C, etc.
+                    key=f"tab4_treatment_{idx}"
+                )
+
+            with col2:
+                unit_id = st.text_input(
+                    f"ID unidad (galpón)",
+                    value=f"GALPÓN_{idx + 1}",
+                    key=f"tab4_unit_id_{idx}"
+                )
+
+            with col3:
+                replicate = st.number_input(
+                    f"Número de réplica",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key=f"tab4_replicate_{idx}"
+                )
+
+            with col4:
+                st.empty()  # Espaciador
+
+            # Datos de aves
+            st.markdown("##### Datos de aves")
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                birds_placed = st.number_input(
+                    f"Aves colocadas",
+                    min_value=1,
+                    value=10000,
+                    step=100,
+                    key=f"tab4_birds_placed_{idx}"
+                )
+
+            with col2:
+                mortality_total = st.number_input(
+                    f"Aves muertas",
+                    min_value=0,
+                    value=200,
+                    step=10,
+                    key=f"tab4_mortality_{idx}"
+                )
+
+            with col3:
+                bw_initial_g = st.number_input(
+                    f"Peso inicial (g)",
+                    min_value=1.0,
+                    value=42.0,
+                    step=1.0,
+                    key=f"tab4_bw_initial_{idx}"
+                )
+
+            with col4:
+                bw_final_g = st.number_input(
+                    f"Peso final (g)",
+                    min_value=1.0,
+                    value=2400.0,
+                    step=10.0,
+                    key=f"tab4_bw_final_{idx}"
+                )
+
+            # Alimento
+            st.markdown("##### Consumo de alimento")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                feed_delivered_kg = st.number_input(
+                    f"Alimento suministrado (kg)",
+                    min_value=0.0,
+                    value=20000.0,
+                    step=100.0,
+                    key=f"tab4_feed_delivered_{idx}"
+                )
+
+            with col2:
+                feed_refusals_kg = st.number_input(
+                    f"Alimento rechazado (kg)",
+                    min_value=0.0,
+                    value=500.0,
+                    step=50.0,
+                    key=f"tab4_feed_refusals_{idx}"
+                )
+
+            # Crear TrialUnitInput para este tratamiento
+            treatment_units[treatment_name] = TrialUnitInput(
+                trial_id=trial_id,
+                unit_type=UnitType.house,
+                unit_id=unit_id,
+                treatment=treatment_name,
+                days=int(days_cycle),
+                birds_placed=int(birds_placed),
+                mortality_total=int(mortality_total),
+                birds_sold=None,
+                feed_delivered_kg=float(feed_delivered_kg),
+                feed_refusals_kg=float(feed_refusals_kg),
+                bw_initial_mean_g=float(bw_initial_g),
+                bw_final_mean_g=float(bw_final_g),
+                bw_final_sd_g=None,
+                final_sample_n=None,
+                diet_cost_per_kg=0.40,  # Default, será reemplazado
+                additive_cost_total=0.0,
+                chick_cost_per_bird=0.80,  # Default
+                other_variable_costs_total=0.0,
+            )
+
+    # ---- PANEL: Parámetros económicos (compartidos) ----
     st.divider()
     _render_economic_inputs(prefix="manual_")
 
-    # ---- Cálculo ----
+    # ---- PANEL: Calcular y comparar ----
     st.divider()
-    st.markdown("### E) Calcular KPIs")
+    st.markdown("### D) Calcular y comparar tratamientos")
 
-    if st.button("🧮 Calcular análisis financiero", key="btn_calc_manual", type="primary"):
-        # Crear TrialUnitInput temporal
-        unit = TrialUnitInput(
-            trial_id=trial_id,
-            unit_type=UnitType.house,
-            unit_id=unit_id,
-            treatment=treatment,
-            days=int(days_cycle),
-            birds_placed=int(birds_placed),
-            mortality_total=int(mortality_total),
-            birds_sold=None,
-            feed_delivered_kg=float(feed_delivered_kg),
-            feed_refusals_kg=float(feed_refusals_kg),
-            bw_initial_mean_g=float(bw_initial_g),
-            bw_final_mean_g=float(bw_final_g),
-            bw_final_sd_g=None,
-            final_sample_n=None,
-            diet_cost_per_kg=st.session_state.get("tab4_cost_feed_kg", 0.45),
-            additive_cost_total=0.0,
-            chick_cost_per_bird=st.session_state.get("tab4_cost_chick", 0.80),
-            other_variable_costs_total=st.session_state.get("tab4_other_cost_bird", 0.15) * int(birds_placed),
-        )
+    if st.button("🧮 Calcular y comparar", key="btn_calc_compare", type="primary"):
+        if not treatment_units:
+            st.error("No hay tratamientos para analizar.")
+            return
 
-        # Parámetros económicos
+        # Obtener parámetros económicos
         kpi_inputs = ProductiveKPIInputs(
             price_kg_sold=st.session_state.get("manual_tab4_price_kg", 2.50),
             cost_feed_per_kg=st.session_state.get("manual_tab4_cost_feed_kg", 0.45),
@@ -1108,125 +1161,204 @@ def _tab4_modo_manual() -> None:
             mortality_cost_pct=st.session_state.get("manual_tab4_mortality_recovery", 20.0),
         )
 
-        # Calcular
-        kpi, warnings = compute_unit_kpis(unit, kpi_inputs)
+        # Actualizar costos en units
+        units_list = []
+        for treatment_name, unit in treatment_units.items():
+            unit.diet_cost_per_kg = kpi_inputs.cost_feed_per_kg
+            unit.chick_cost_per_bird = kpi_inputs.cost_chick_per_bird
+            unit.other_variable_costs_total = kpi_inputs.other_costs_per_bird * unit.birds_placed
+            units_list.append(unit)
+
+        # Calcular KPIs
+        kpis, warnings = compute_productive_kpis_batch(units_list, kpi_inputs)
 
         if warnings:
             with st.expander("⚠️ Advertencias", expanded=False):
                 for w in warnings:
                     st.warning(f"**{w.code.value}**: {w.message}")
 
-        # Mostrar resultados en cards
-        st.markdown("### F) Resultados")
+        df_kpis = kpis_to_dataframe(kpis)
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        # ---- RESULTADOS ----
+        st.markdown("### E) Resultados por tratamiento")
 
-        col1.metric(
-            "Aves finales",
-            f"{kpi.birds_end:,.0f}",
-            delta=f"{kpi.mortality_pct:.1f}% mortalidad"
-        )
-        col2.metric(
-            "Alimento consumido",
-            f"{kpi.feed_consumed_kg:,.0f} kg",
-            delta=f"{kpi.feed_consumed_kg/kpi.birds_end:.2f} kg/ave" if kpi.birds_end > 0 else "—"
-        )
-        col3.metric(
-            "FCR",
-            f"{kpi.fcr:.2f}" if kpi.fcr else "—",
-            delta="índice conversión"
-        )
-        col4.metric(
-            "EPEF",
-            f"{kpi.epef:.1f}" if kpi.epef else "—",
-            delta="eficiencia europea"
-        )
-        col5.metric(
-            "Margen",
-            f"${kpi.margin_total:,.2f}",
-            delta=f"{kpi.margin_pct:.1f}%" if kpi.margin_pct else "—"
+        # Tabla principal
+        st.markdown("#### Tabla comparativa de KPIs")
+        st.dataframe(
+            df_kpis[["treatment", "birds_placed", "mortality_pct", "feed_consumed_kg", 
+                      "wg_total_per_bird_g", "fcr", "revenue_total", "total_cost", 
+                      "margin_total", "margin_pct", "epef"]].round(2),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "treatment": st.column_config.TextColumn("Tratamiento", width=100),
+                "birds_placed": st.column_config.NumberColumn("Aves", format="%d"),
+                "mortality_pct": st.column_config.NumberColumn("Mort. %", format="%.1f"),
+                "feed_consumed_kg": st.column_config.NumberColumn("Alimento (kg)", format="%.0f"),
+                "wg_total_per_bird_g": st.column_config.NumberColumn("Ganancia/ave (g)", format="%.0f"),
+                "fcr": st.column_config.NumberColumn("FCR", format="%.2f"),
+                "revenue_total": st.column_config.NumberColumn("Ingresos ($)", format="%.2f"),
+                "total_cost": st.column_config.NumberColumn("Costo ($)", format="%.2f"),
+                "margin_total": st.column_config.NumberColumn("Margen ($)", format="%.2f"),
+                "margin_pct": st.column_config.NumberColumn("Margen %", format="%.1f"),
+                "epef": st.column_config.NumberColumn("EPEF", format="%.1f"),
+            }
         )
 
-        # Tabla resumen financiero
-        st.markdown("#### Resumen financiero")
-        financial_data = {
-            "Concepto": [
-                "Ingresos por venta",
-                "Costo alimento",
-                "Costo pollito",
-                "Otros costos",
-                "Costo total",
-                "Margen bruto",
-            ],
-            "Valor ($)": [
-                f"{kpi.revenue_total:.2f}",
-                f"{kpi.feed_cost_total:.2f}",
-                f"{kpi.bird_cost_total:.2f}",
-                f"{kpi.other_cost_total:.2f}",
-                f"{kpi.total_cost:.2f}",
-                f"{kpi.margin_total:.2f}",
-            ],
-        }
-        df_financial = pd.DataFrame(financial_data)
-        st.dataframe(df_financial, use_container_width=True, hide_index=True)
+        # ---- Resumen por tratamiento ----
+        st.divider()
+        st.markdown("### F) Resumen por tratamiento")
 
-        # Tabla detallada de KPIs
-        st.markdown("#### KPIs detallados")
-        kpis_data = {
-            "Métrica": [
-                "Peso inicial",
-                "Peso final",
-                "Ganancia / ave",
-                "ADG (g/día)",
-                "Ganancia total",
-                "Costo / kg alimento",
-                "Costo / ave",
-                "Costo / kg ganancia",
-                "Precio / kg venta",
-            ],
-            "Valor": [
-                f"{kpi.bw_initial_g:.0f} g",
-                f"{kpi.bw_final_g:.0f} g",
-                f"{kpi.wg_total_per_bird_g:.0f} g",
-                f"{kpi.adg_per_bird_per_day_g:.2f} g/día",
-                f"{kpi.total_liveweight_gain_kg:,.0f} kg",
-                f"${kpi_inputs.cost_feed_per_kg:.2f}",
-                f"${kpi.total_cost / kpi.birds_placed:.2f}",
-                f"${kpi.total_cost / kpi.total_liveweight_gain_kg if kpi.total_liveweight_gain_kg > 0 else 0:.2f}",
-                f"${kpi_inputs.price_kg_sold:.2f}",
-            ],
-        }
-        df_kpis = pd.DataFrame(kpis_data)
-        st.dataframe(df_kpis, use_container_width=True, hide_index=True)
+        summary_treatment = compute_summary_by_treatment(df_kpis)
+        if not summary_treatment.empty:
+            st.dataframe(summary_treatment.round(2), use_container_width=True, hide_index=True)
 
-        # Gráfico waterfall
+        # ---- Totales globales ----
+        st.divider()
+        st.markdown("### G) Totales globales")
+
+        totals = compute_total_summary(df_kpis)
+
+        if totals:
+            col1, col2, col3, col4, col5 = st.columns(5)
+
+            col1.metric(
+                "Total aves",
+                f"{totals.get('total_birds_placed', 0):,.0f}",
+                delta=f"{totals.get('total_mortality', 0)} muertas"
+            )
+            col2.metric(
+                "Alimento total",
+                f"{totals.get('total_feed_consumed_kg', 0):,.0f} kg",
+            )
+            col3.metric(
+                "FCR promedio",
+                f"{totals.get('avg_fcr', 0):.2f}",
+            )
+            col4.metric(
+                "EPEF promedio",
+                f"{totals.get('avg_epef', 0):.1f}" if totals.get('avg_epef') else "—",
+            )
+            col5.metric(
+                "Margen total",
+                f"${totals.get('total_margin', 0):,.2f}",
+            )
+
+        # ---- Gráficos de comparación ----
+        st.divider()
+        st.markdown("### H) Gráficos comparativos")
+
         try:
             import plotly.graph_objects as go
+            import plotly.express as px
 
-            fig = go.Figure(go.Waterfall(
-                name="Flujo financiero",
-                orientation="v",
-                x=["Ingresos", "Alimento", "Pollito", "Otros", "Margen"],
-                y=[
-                    kpi.revenue_total,
-                    -kpi.feed_cost_total,
-                    -kpi.bird_cost_total,
-                    -kpi.other_cost_total,
-                    kpi.margin_total,
-                ],
-                connector={"line": {"color": "rgba(63, 63, 63, 0.5)"}},
-                increasing={"marker": {"color": "#4CAF50"}},
-                decreasing={"marker": {"color": "#f44336"}},
-                totals={"marker": {"color": "#2176ff"}},
-            ))
-            fig.update_layout(
-                title="Flujo financiero",
+            # 1. Comparación de ingresos vs costos
+            fig_comparison = go.Figure()
+
+            for _, row in df_kpis.iterrows():
+                fig_comparison.add_trace(go.Bar(
+                    name=f"{row['treatment']} - Ingresos",
+                    x=[row['treatment']],
+                    y=[row['revenue_total']],
+                    marker_color="#4CAF50"
+                ))
+                fig_comparison.add_trace(go.Bar(
+                    name=f"{row['treatment']} - Costo",
+                    x=[row['treatment']],
+                    y=[row['total_cost']],
+                    marker_color="#f44336"
+                ))
+                fig_comparison.add_trace(go.Bar(
+                    name=f"{row['treatment']} - Margen",
+                    x=[row['treatment']],
+                    y=[row['margin_total']],
+                    marker_color="#2176ff"
+                ))
+
+            fig_comparison.update_layout(
+                title="Ingresos vs Costos vs Margen por Tratamiento",
                 template="plotly_white",
+                barmode="group",
                 height=450,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig_comparison, use_container_width=True)
+
+            # 2. FCR y EPEF
+            fig_efficiency = go.Figure()
+
+            fig_efficiency.add_trace(go.Bar(
+                name="FCR",
+                x=df_kpis["treatment"],
+                y=df_kpis["fcr"],
+                marker_color="#FF9800",
+                yaxis="y1"
+            ))
+
+            fig_efficiency.add_trace(go.Scatter(
+                name="EPEF",
+                x=df_kpis["treatment"],
+                y=df_kpis["epef"],
+                mode="lines+markers",
+                marker=dict(size=10, color="#2176ff"),
+                yaxis="y2"
+            ))
+
+            fig_efficiency.update_layout(
+                title="FCR y EPEF por Tratamiento",
+                template="plotly_white",
+                height=450,
+                yaxis=dict(title="FCR", side="left"),
+                yaxis2=dict(title="EPEF", overlaying="y", side="right"),
+            )
+            st.plotly_chart(fig_efficiency, use_container_width=True)
+
+            # 3. Rentabilidad (margen %)
+            fig_margin = px.bar(
+                df_kpis,
+                x="treatment",
+                y="margin_pct",
+                title="Margen de rentabilidad por Tratamiento (%)",
+                labels={"margin_pct": "Margen (%)", "treatment": "Tratamiento"},
+                color="margin_pct",
+                color_continuous_scale="RdYlGn",
+            )
+            fig_margin.update_layout(height=450)
+            st.plotly_chart(fig_margin, use_container_width=True)
+
         except ImportError:
             st.info("Instala plotly para ver gráficos: pip install plotly")
+
+        # ---- Análisis de diferencias ----
+        st.divider()
+        st.markdown("### I) Análisis de diferencias entre tratamientos")
+
+        if len(df_kpis) > 1:
+            best_margin_idx = df_kpis["margin_total"].idxmax()
+            best_margin_treatment = df_kpis.loc[best_margin_idx, "treatment"]
+            best_margin_value = df_kpis.loc[best_margin_idx, "margin_total"]
+
+            worst_margin_idx = df_kpis["margin_total"].idxmin()
+            worst_margin_treatment = df_kpis.loc[worst_margin_idx, "treatment"]
+            worst_margin_value = df_kpis.loc[worst_margin_idx, "margin_total"]
+
+            difference = best_margin_value - worst_margin_value
+            pct_difference = (difference / abs(worst_margin_value)) * 100 if worst_margin_value != 0 else 0
+
+            st.success(f"🏆 **Mejor margen:** {best_margin_treatment} (${best_margin_value:,.2f})")
+            st.error(f"📉 **Menor margen:** {worst_margin_treatment} (${worst_margin_value:,.2f})")
+            st.info(f"💰 **Diferencia:** ${difference:,.2f} ({pct_difference:.1f}%)")
+
+            # Análisis de FCR
+            best_fcr_idx = df_kpis["fcr"].idxmin()
+            best_fcr_treatment = df_kpis.loc[best_fcr_idx, "treatment"]
+            best_fcr_value = df_kpis.loc[best_fcr_idx, "fcr"]
+
+            worst_fcr_idx = df_kpis["fcr"].idxmax()
+            worst_fcr_treatment = df_kpis.loc[worst_fcr_idx, "treatment"]
+            worst_fcr_value = df_kpis.loc[worst_fcr_idx, "fcr"]
+
+            st.success(f"⭐ **Mejor FCR:** {best_fcr_treatment} ({best_fcr_value:.2f})")
+            st.warning(f"⚠️ **Peor FCR:** {worst_fcr_treatment} ({worst_fcr_value:.2f})")
 
 
 def _render_economic_inputs(prefix: str = "tab4_") -> None:
@@ -1313,8 +1445,7 @@ def _render_kpi_results(units_filtered: List[Any]) -> None:
         mortality_cost_pct=st.session_state.get("tab4_mortality_recovery", 20.0),
     )
 
-    st.divider()
-    st.markdown("### F) Resultados por unidad")
+    st.markdown("### E) Resultados por unidad")
 
     try:
         kpis, warnings = compute_productive_kpis_batch(units_filtered, kpi_inputs)
@@ -1345,14 +1476,14 @@ def _render_kpi_results(units_filtered: List[Any]) -> None:
         )
 
         st.divider()
-        st.markdown("### G) Resumen por tratamiento")
+        st.markdown("### F) Resumen por tratamiento")
 
         summary_treatment = compute_summary_by_treatment(df_kpis)
         if not summary_treatment.empty:
             st.dataframe(summary_treatment.round(2), use_container_width=True, hide_index=True)
 
         st.divider()
-        st.markdown("### H) Totales globales (Executive Summary)")
+        st.markdown("### G) Totales globales (Executive Summary)")
 
         totals = compute_total_summary(df_kpis)
 
